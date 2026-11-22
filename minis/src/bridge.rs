@@ -1,23 +1,3 @@
-//! Open Minis's own commands, which a program in its Linux shell runs like any
-//! other executable: `minis-bonjour` (Bonjour, done by the app), and
-//! `apple-notification` and `apple-player` (native offloads). Each prints one
-//! JSON envelope (OpenMinis/OpenMinis, src/shared/cli/bonjour.md):
-//!
-//! ```text
-//! { "ok": true,  "tool": "…", "action": "…", "data": { … } }
-//! { "ok": false, "tool": "…", "action": "…", "error": { "code": "…", "message": "…" } }
-//! ```
-//!
-//! The shell itself can't advertise: iOS refuses its multicast (`sendto` →
-//! EHOSTUNREACH, no multicast entitlement), and only accepts the Bonjour types
-//! the app's Info.plist declares. `minis-bonjour advertise` publishes from the
-//! app instead, and forwards each connection to a port inside the shell.
-//!
-//! `minis-bonjour` came with Minis 1.16 (App Store, 2026-11-14; its TestFlight
-//! builds from late October). 1.15 and earlier don't have it, and Minis
-//! doesn't tell the shell its version, so its absence is how siboot knows a
-//! Minis is too old and stops (preflight.rs).
-
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -26,38 +6,29 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::process::Command;
 
-/// What a pairable host advertises, and what iOS 27's Settings › Developer Mode
-/// lists "Pair with …" entries by.
 pub const PAIRABLE_HOST_TYPE: &str = "_remotepairing-pairable-host._tcp";
 
-/// The bridge answers within 75 s or gives up itself; `advertise` within 8 s.
 const CALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Debug, Default)]
 pub struct Bridge {
-    /// Where the commands are. None: `$PATH`, as in Minis.
     dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 pub enum BridgeError {
-    /// The command isn't there: not Open Minis, or a build without it.
     Missing(String),
-    /// It ran and refused, with the bridge's error code (`not_declared`,
-    /// `authorization_denied`, `disabled`, `not_available`, …).
     Refused { code: String, message: String },
-    /// It answered something other than the envelope.
     Unreadable(String),
-    /// It couldn't be run, or didn't answer in time.
     Failed(String),
 }
 
 impl fmt::Display for BridgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing(tool) => write!(f, "`{tool}` isn't installed here"),
+            Self::Missing(tool) => write!(f, "`{tool}` не установлена"),
             Self::Refused { code, message } => write!(f, "{code}: {message}"),
-            Self::Unreadable(text) => write!(f, "unreadable answer: {text}"),
+            Self::Unreadable(text) => write!(f, "не удалось прочитать ответ: {text}"),
             Self::Failed(why) => write!(f, "{why}"),
         }
     }
@@ -72,19 +43,13 @@ impl BridgeError {
     }
 }
 
-/// One `minis-bonjour advertise`, as `advertise` and `list` describe it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Advert {
     pub id: String,
     pub service_type: String,
-    /// The name the OS registered, which can differ from the requested one
-    /// after a conflict ("siboot (2)").
     pub name: String,
-    /// `starting`, `ready`, `failed` or `stopped`.
     pub state: String,
-    /// The app's own listener, which is what Bonjour points at.
     pub listener_port: Option<u16>,
-    /// The port inside the shell it forwards to.
     pub guest_port: Option<u16>,
     pub failed_reason: Option<String>,
     pub warning: Option<String>,
@@ -110,20 +75,17 @@ impl Advert {
         })
     }
 
-    /// Whether this is an advertisement of the type Settings pairs with.
     pub fn is_pairable_host(&self) -> bool {
         normalize_type(&self.service_type) == PAIRABLE_HOST_TYPE
     }
 }
 
-/// `_X._tcp.` (iOS's spelling, with the trailing dot) as `_X._tcp`.
 fn normalize_type(t: &str) -> String {
     t.trim_end_matches('.').to_ascii_lowercase()
 }
 
 pub struct Types {
     pub types: Vec<String>,
-    /// True on iOS: only these types work, and only a new app build adds one.
     pub restricted: bool,
 }
 
@@ -140,8 +102,6 @@ pub struct Listing {
 }
 
 impl Bridge {
-    /// `SIBOOT_MINIS_BIN` names a folder to take the commands from (for tests
-    /// with stand-ins); otherwise they come from `$PATH`.
     pub fn from_env() -> Self {
         Self {
             dir: std::env::var_os("SIBOOT_MINIS_BIN").map(PathBuf::from),
@@ -162,7 +122,6 @@ impl Bridge {
         }
     }
 
-    /// Run `tool args… --compact` and return the envelope's `data`.
     pub async fn call(&self, tool: &str, args: &[&str]) -> Result<Value, BridgeError> {
         let child = Command::new(self.program(tool))
             .args(args)
@@ -174,7 +133,7 @@ impl Bridge {
             .spawn()
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => BridgeError::Missing(tool.to_string()),
-                _ => BridgeError::Failed(format!("couldn't run {tool}: {e}")),
+                _ => BridgeError::Failed(format!("не удалось запустить {tool}: {e}")),
             })?;
         let out = tokio::time::timeout(CALL_TIMEOUT, child.wait_with_output())
             .await
@@ -188,8 +147,6 @@ impl Bridge {
         parse_envelope(&out.stdout, &out.stderr)
     }
 
-    /// The same, blocking and fire-and-forget: for a guard's `Drop`, where
-    /// nothing can be awaited.
     pub fn call_now(&self, tool: &str, args: &[&str]) {
         let _ = std::process::Command::new(self.program(tool))
             .args(args)
@@ -200,11 +157,8 @@ impl Bridge {
             .status();
     }
 
-    // MARK: minis-bonjour
-
     pub async fn bonjour_types(&self) -> Result<Types, BridgeError> {
         let data = self.call("minis-bonjour", &["types"]).await?;
-        // `types` is a list of strings; tolerate {type: …} items too.
         let types = data
             .get("types")
             .and_then(Value::as_array)
@@ -240,8 +194,6 @@ impl Bridge {
         })
     }
 
-    /// Publish `service_type` as `name`, forwarding to `port` inside the shell.
-    /// The returned guard withdraws it when dropped.
     pub async fn advertise(
         &self,
         service_type: &str,
@@ -280,9 +232,6 @@ impl Bridge {
         self.call("minis-bonjour", &["stop", id]).await.map(|_| ())
     }
 
-    // MARK: apple-notification
-
-    /// `authorized`, `denied`, `not_determined`, `provisional` or `ephemeral`.
     pub async fn notification_status(&self) -> Result<String, BridgeError> {
         let data = self.call("apple-notification", &["settings"]).await?;
         Ok(data
@@ -292,7 +241,6 @@ impl Bridge {
             .to_string())
     }
 
-    /// A local notification a second from now, so it shows over Settings.
     pub async fn notify(&self, title: &str, body: &str) -> Result<(), BridgeError> {
         self.call(
             "apple-notification",
@@ -302,9 +250,6 @@ impl Bridge {
         .map(|_| ())
     }
 
-    // MARK: apple-player
-
-    /// Play an audio file in Minis's own player; returns its session id.
     pub async fn play(&self, file: &Path) -> Result<String, BridgeError> {
         let path = file.to_string_lossy();
         let data = self.call("apple-player", &["play", path.as_ref()]).await?;
@@ -322,8 +267,6 @@ impl Bridge {
             .map(|_| ())
     }
 
-    /// `playing` or `paused`. Refused once the player's sheet has been closed,
-    /// which ends its session.
     pub async fn player_status(&self, session: &str) -> Result<String, BridgeError> {
         let data = self.call("apple-player", &["status", session]).await?;
         Ok(data
@@ -340,9 +283,6 @@ impl Bridge {
     }
 }
 
-/// A live advertisement. Withdrawn by `stop`, or by `Drop` if a step fails or
-/// the run is interrupted first: a leftover "Pair with …" entry would pair the
-/// iPhone with a host that's no longer listening.
 pub struct Advertisement {
     bridge: Bridge,
     advert: Option<Advert>,
@@ -356,7 +296,7 @@ impl Advertisement {
     pub async fn stop(mut self) {
         if let Some(advert) = self.advert.take() {
             if let Err(e) = self.bridge.stop_advert(&advert.id).await {
-                tracing::warn!("couldn't withdraw advertisement {}: {e}", advert.id);
+                tracing::warn!("не удалось снять объявление {}: {e}", advert.id);
             }
         }
     }
@@ -370,9 +310,6 @@ impl Drop for Advertisement {
     }
 }
 
-/// The envelope's `data`, or why there isn't any. With `--compact` the JSON is
-/// the last line of stdout that parses (help text goes to stderr); without, it
-/// spans the lines from the first `{` to the last `}`.
 pub fn parse_envelope(stdout: &[u8], stderr: &[u8]) -> Result<Value, BridgeError> {
     let text = String::from_utf8_lossy(stdout);
     let spanning = || {

@@ -1,6 +1,7 @@
 [package]
 name = "siboot-pair"
-version = "0.4.0"
+version = "0.4.1"
+authors = ["ripcats"]
 edition = "2021"
 description = "siboot's pairing step for rootshell's WASM runtime: pairs the iPhone with itself from an App Store app"
 license = "MIT"

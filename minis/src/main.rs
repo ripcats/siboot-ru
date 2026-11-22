@@ -1,29 +1,3 @@
-//! `siboot` for Open Minis: installs SideInstaller onto the iPhone it runs on,
-//! with no computer and no paid certificate.
-//!
-//! Open Minis (App Store) runs Alpine Linux on an ARM64 build of iSH, so this is
-//! an ordinary static aarch64 Linux binary built on the same vendored idevice
-//! and isideload as SideInstaller. It pairs this iPhone with itself too:
-//! Minis 1.16 advertises the pairing host for it (pairing.rs, bridge.rs).
-//! Where Minis can't, the pairing comes from rootshell, another App Store app,
-//! whose siboot-pair (../rootshell) hands the file over on the iPhone's
-//! loopback (see README.md).
-//!
-//! The steps:
-//! 1 check · 2 pairing · 3 connect · 4 Apple ID · 5 sign · 6 install · 7 hand over.
-//! `siboot developer-mode` runs 1–3, then asks for Developer Mode (devmode.rs).
-//!
-//! The Apple ID password goes only to Apple (as an SRP proof, via isideload) and
-//! is never written to disk or logged. Like SideInstaller, the developer token
-//! and signing key are kept, in ~/.siboot/isideload, so a second run needn't
-//! sign in again. The Apple Accounts that signed in are kept too, by email, in
-//! ~/.siboot/apple-accounts (saved.rs): a later run offers them, and asks for
-//! the password only once Apple wants it again.
-//!
-//! In Open Minis the run shows as a page in Minis's browser, served on this
-//! iPhone's loopback, and asks its questions there (web.rs); `--terminal`
-//! keeps it in the terminal.
-
 mod account;
 mod bridge;
 mod devmode;
@@ -43,9 +17,6 @@ mod tunnel;
 mod ui;
 mod web;
 
-// rust-core's saved-session sign-in, compiled here unchanged so siboot signs in
-// exactly as SideInstaller does (anisette identity rules, -80046 skip, token
-// reuse). `crate::error_text` is the path it expects.
 #[allow(dead_code)]
 #[path = "../../SideInstaller/rust-core/src/apple_session.rs"]
 mod apple_session;
@@ -54,54 +25,63 @@ mod apple_session;
 mod error_text;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use bridge::Bridge;
 use fail::{Fail, Result};
+use keepalive::KeepAlive;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Steps in the full run. Plain output's numbering stays fixed for `check`
-/// and `connect`, so it means the same thing in every install mode.
-const STAGES: usize = 7;
-/// `developer-mode`: the install's first three steps, then Developer Mode.
+const STAGES: usize = 8;
 const DEVMODE_STAGES: usize = 4;
-/// The steps' names on the live screen, in order.
-const STEP_NAMES: [&str; STAGES] = ["Check", "Pairing", "Connect", "Apple ID", "Sign", "Install", "Handover"];
+const STEP_NAMES: [&str; STAGES] = [
+    "Связь с iPhone",
+    "Файл сопряжения",
+    "Туннель к iPhone",
+    "Интернет",
+    "Вход в Apple ID",
+    "Подпись SideInstaller",
+    "Копирование на iPhone",
+    "Настройка SideInstaller",
+];
+const APP_STEP_NAMES: [&str; 7] = [
+    "Связь с iPhone",
+    "Файл сопряжения",
+    "Туннель к iPhone",
+    "Интернет",
+    "Вход в Apple ID",
+    "Подпись приложения",
+    "Установка приложения",
+];
+const CHECK_NAMES: [&str; 2] = ["Связь с iPhone", "Интернет"];
 const DEVMODE_NAME: &str = "Dev Mode";
 
-/// LocalDevVPN's address for this iPhone: traffic to it comes back to the
-/// device's own services.
+const HANDOFF_NOTES: [&str; 2] = [
+    "Беззвучный плеер не даёт iOS приостановить Minis. Не закрывайте его.",
+    "Вернитесь в Minis и подтвердите действие.",
+];
+
 const DEFAULT_DEVICE_IP: Ipv4Addr = Ipv4Addr::new(10, 7, 0, 1);
-/// The device's RPPairing listener (remoted), as SideInstaller dials it. It's
-/// nearly always there, and step 1 looks for it when it isn't (preflight.rs).
 const DEFAULT_RP_PORT: u16 = 49152;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Every step.
     All,
-    /// Step 1 only.
     Check,
-    /// Steps 1-3: pair, or take the pairing, and prove the tunnel works with it.
     Connect,
-    /// Steps 1-3, then show Developer Mode in Settings (or turn it on).
     DeveloperMode,
 }
 
 #[derive(Clone)]
 pub struct Args {
     pub command: Command,
-    /// With `developer-mode`: turn it on, not only show it.
     pub turn_on: bool,
     pub verbose: bool,
-    /// Plain lines, not the live screen.
     pub plain: bool,
-    /// The run as a page in Open Minis's browser (`--web`), or in the terminal
-    /// (`--terminal`). Neither: the page where there's Minis to show it.
     pub web: Option<bool>,
     pub device: SocketAddr,
-    /// ~/.siboot: the pairing file, isideload's store, downloads.
     pub home: PathBuf,
     pub pairing_file: Option<PathBuf>,
     pub apple_id: Option<String>,
@@ -118,7 +98,9 @@ impl Args {
 }
 
 fn default_home() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| ".".into());
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ".".into());
     home.join(".siboot")
 }
 
@@ -179,7 +161,7 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> std::result::Result<Par
                     _ => Command::DeveloperMode,
                 };
             }
-            other => return Err(format!("unrecognised argument `{other}`")),
+            other => return Err(format!("неизвестный аргумент `{other}`")),
         }
     }
     if args.turn_on && args.command != Command::DeveloperMode {
@@ -188,85 +170,81 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> std::result::Result<Par
     Ok(Parsed::Run(args))
 }
 
-/// Kept narrow: Minis's terminal is an iPhone's, about 45 columns upright.
 fn usage() {
     use std::io::IsTerminal;
     let styled = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    let head = |text: &str| if styled { format!("\x1b[1m{text}\x1b[0m") } else { text.to_string() };
-    let flag = |text: &str| if styled { format!("\x1b[36m{text}\x1b[0m") } else { text.to_string() };
+    let head = |text: &str| {
+        if styled {
+            format!("\x1b[1m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
+    let flag = |text: &str| {
+        if styled {
+            format!("\x1b[36m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
     println!(
         "\
 {name} {VERSION}
-Installs SideInstaller onto this iPhone, from
-Open Minis, with your own Apple Account.
+Устанавливает SideInstaller на этот iPhone через Open Minis с вашей учётной записью Apple.
 
 {usage}
   siboot [command] [options]
 
-  With no command, every step runs: check,
-  pair this iPhone with siboot (in Settings,
-  the first time), connect, sign in, sign
-  SideInstaller, install it, and hand it the
-  pairing.
+  Без команды выполняются все шаги: проверка LocalDevVPN
+  и iPhone, сопряжение с siboot (в первый раз — в Настройках),
+  подключение, проверка сети, вход в Apple ID, подпись
+  и установка SideInstaller, передача ему файла сопряжения.
+  С --ipa PATH|URL устанавливается указанное приложение.
 
 {commands}
   {check}
-      Only check that LocalDevVPN, this iPhone
-      and the internet are ready.
+      Проверить LocalDevVPN, iPhone и доступ в интернет.
   {connect}
-      Check, pair, and only open the tunnel
-      with the pairing.
+      Проверить подключение, выполнить сопряжение
+      и открыть туннель.
   {devmode}
-      Connect, and if Developer Mode is off, show
-      its switch under Settings › Privacy &
-      Security. Sends nothing when it's on. With
-      --turn-on, turn it on instead, after
-      asking: the iPhone restarts. iOS allows
-      that only without a passcode; with one,
-      siboot shows the switch instead.
+      Подключиться и показать переключатель режима
+      разработчика в Настройках, если он выключен.
+      Если он включён, ничего не отправлять. С --turn-on
+      запросить включение: iPhone перезагрузится.
+      iOS разрешает это только без код-пароля.
 
 {options}
   {apple_id}
-      Apple Account to sign with (else
-      SIBOOT_APPLE_ID, else it offers the
-      saved ones, or asks). The password
-      comes from SIBOOT_PASSWORD or a prompt
-      that shows only dots, and only when
-      Apple wants it.
+      Учётная запись Apple (иначе SIBOOT_APPLE_ID,
+      сохранённые записи или запрос). Пароль берётся
+      из SIBOOT_PASSWORD или запрашивается, только
+      если он нужен Apple.
   {ipa}
-      Install this IPA instead of SideInstaller's
-      latest release.
+      Установить этот IPA вместо SideInstaller.
   {anisette}
-      Sign in through this anisette server only.
+      Использовать только этот сервер anisette.
   {turn_on}
-      With developer-mode: turn it on, not only
-      show it.
+      Для developer-mode: включить режим, а не только показать переключатель.
   {device_ip}
-      LocalDevVPN's address for this iPhone
-      (default {ip}).
+      Адрес iPhone в LocalDevVPN (по умолчанию {ip}).
   {port}
-      The iPhone's RPPairing port (default {rp}).
-      When nothing answers there, siboot looks
-      on the iPhone's other ports.
+      Порт RPPairing на iPhone (по умолчанию {rp}).
+      Если ответа нет, siboot проверит другие порты.
   {pairing_file}
-      Default ~/.siboot/rp_pairing_file.plist.
+      По умолчанию ~/.siboot/rp_pairing_file.plist.
   {home}
-      Where siboot keeps its files (default
-      ~/.siboot).
+      Каталог данных siboot (по умолчанию ~/.siboot).
   {terminal}
-      Answer here in the terminal, not on the
-      page in Minis's browser.
+      Отвечать в терминале, а не в браузере Minis.
   {plain}
-      Plain lines instead of the live screen
-      in the terminal.
+      Обычный текст вместо интерактивного экрана.
   {web}
-      The page even outside Minis: siboot
-      prints its address.
+      Открыть страницу и вне Minis; siboot выведет её адрес.
   {verbose}
-      Show the underlying protocol and library
-      errors (plain lines, too).
+      Показывать подробности ошибок протокола и библиотек.
   {help}
-      Show this message.
+      Показать эту справку.
 
 {needs}
   iOS 27 or later, Developer Mode on, Wi-Fi,
@@ -304,7 +282,7 @@ fn main() -> ExitCode {
         Ok(p) => p,
         Err(problem) => {
             eprintln!("siboot: {problem}");
-            eprintln!("try `siboot --help`");
+            eprintln!("Справка: `siboot --help`");
             return ExitCode::from(2);
         }
     };
@@ -320,12 +298,11 @@ fn main() -> ExitCode {
         Parsed::Run(args) => args,
     };
 
-    // Served before anything is shown, so the page gets every event.
     let page = if args.web.unwrap_or_else(web::available) {
         match web::start() {
             Ok(url) => Some(url),
             Err(e) => {
-                eprintln!("siboot: couldn't serve the page ({e}), so it runs here instead");
+                eprintln!("siboot: не удалось открыть страницу ({e}); продолжаю в терминале");
                 None
             }
         }
@@ -337,17 +314,17 @@ fn main() -> ExitCode {
     ui::header(
         VERSION,
         if args.command == Command::DeveloperMode {
-            "Shows Developer Mode, or turns it on."
+            "Показывает режим разработчика или включает его."
+        } else if args.ipa.is_some() {
+            "Устанавливает указанное приложение на этот iPhone."
         } else {
-            "Installs SideInstaller on this iPhone."
+            "Устанавливает SideInstaller на этот iPhone."
         },
     );
     if let Some(url) = &page {
         show_page(url);
     }
 
-    // Two workers: the software TCP stack inside the tunnel keeps moving while
-    // a foreground task waits on it, and threads are cheap next to emulation.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -355,27 +332,14 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            ui::failure("Couldn't start the async runtime.", &e.to_string());
+            ui::failure("Не удалось запустить среду выполнения.", &e.to_string());
             ui::close();
             return ExitCode::FAILURE;
         }
     };
 
-    if page.is_some() {
-        // A question waits for the page with this thread blocked, so the
-        // select below can't see Ctrl-C then. A task on a worker can.
-        runtime.spawn(async {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                ui::stop_now("Stopped with Ctrl-C.");
-            }
-        });
-    }
-    let outcome = runtime.block_on(async {
-        tokio::select! {
-            outcome = pipeline(&args) => outcome,
-            _ = tokio::signal::ctrl_c() => Err(Fail::by_user("Stopped with Ctrl-C.")),
-        }
-    });
+    watch_interrupt();
+    let outcome = runtime.block_on(pipeline(&args));
     let code = match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(f) => {
@@ -388,16 +352,13 @@ fn main() -> ExitCode {
     code
 }
 
-/// Opens the page in Minis's browser, and opens it again whenever return is
-/// pressed in the terminal, for a page swiped away. These lines are for the
-/// terminal only, and kept out of the log: the address carries the key.
 fn show_page(url: &str) {
-    web::on_stop(|| ui::stop_now("Stopped from the page."));
+    web::on_stop(|| ui::stop_now("Остановлено со страницы."));
     if web::show(url) {
-        println!("      The page is open in Minis's browser. Closed it?");
-        println!("      Press return here to open it again.");
-        println!("      To type here instead, stop with Ctrl-C");
-        println!("      and run siboot --terminal.");
+        println!("      Страница открыта в браузере Minis. Закрыли её?");
+        println!("      Нажмите Enter, чтобы открыть её снова.");
+        println!("      Чтобы отвечать здесь, остановите siboot сочетанием Ctrl-C");
+        println!("      и запустите его с параметром --terminal.");
         let url = url.to_string();
         std::thread::spawn(move || {
             use std::io::BufRead;
@@ -409,28 +370,29 @@ fn show_page(url: &str) {
             }
         });
     } else {
-        println!("      Open this in a browser on this iPhone, and");
-        println!("      keep this terminal open:");
+        println!("      Откройте адрес в браузере этого iPhone и");
+        println!("      не закрывайте терминал:");
         println!("      {url}");
     }
 }
 
-/// idevice's and isideload's own logs go to stderr: warnings by default, and
-/// everything they say with `--verbose`. The run's log (`report.rs`) keeps
-/// what they say at info and above either way: debug can carry what Apple
-/// and the anisette server send.
-///
-/// hyper-util warns on every connection that the socket refused
-/// `TCP_USER_TIMEOUT`, which iSH doesn't implement; the connection is fine, so
-/// that warning only shows with `--verbose`.
 fn init_logging(verbose: bool) {
     use tracing_subscriber::filter::{LevelFilter, Targets};
     use tracing_subscriber::prelude::*;
 
-    let level = if verbose { LevelFilter::DEBUG } else { LevelFilter::WARN };
-    let quiet = if verbose { LevelFilter::DEBUG } else { LevelFilter::ERROR };
-    let filter = Targets::new().with_default(level).with_target("hyper_util", quiet);
-    // On the live screen, above its live area, so a warning doesn't tear it.
+    let level = if verbose {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::WARN
+    };
+    let quiet = if verbose {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::ERROR
+    };
+    let filter = Targets::new()
+        .with_default(level)
+        .with_target("hyper_util", quiet);
     if ui::is_live() {
         let fmt = tracing_subscriber::fmt::layer()
             .with_writer(ui::LogLines)
@@ -438,18 +400,23 @@ fn init_logging(verbose: bool) {
             .with_target(false)
             .without_time()
             .with_filter(filter);
-        let _ = tracing_subscriber::registry().with(fmt).with(record_layer()).try_init();
+        let _ = tracing_subscriber::registry()
+            .with(fmt)
+            .with(record_layer())
+            .try_init();
     } else {
         let fmt = tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_target(verbose)
             .without_time()
             .with_filter(filter);
-        let _ = tracing_subscriber::registry().with(fmt).with(record_layer()).try_init();
+        let _ = tracing_subscriber::registry()
+            .with(fmt)
+            .with(record_layer())
+            .try_init();
     }
 }
 
-/// The libraries' lines at info and above, into the run's log.
 fn record_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -468,158 +435,381 @@ where
         .with_filter(kept)
 }
 
+fn watch_interrupt() {
+    let _ = std::thread::Builder::new()
+        .name("siboot-interrupt".into())
+        .spawn(|| {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    ui::stop_now("Остановлено по Ctrl-C.");
+                }
+            });
+        });
+}
+
+fn start_gate(custom_ipa: bool) -> bool {
+    ui::get_ready_and_confirm(
+        if custom_ipa {
+            "Установка приложения"
+        } else {
+            "Установка SideInstaller"
+        },
+        &["Включите LocalDevVPN, статус должен быть Connected."],
+        &["Затем нажмите «Начать установку»."],
+        "Начать установку",
+    )
+}
+
+fn retryable(f: &Fail) -> bool {
+    !f.by_user && !f.known
+}
+
+fn retry_device(f: &Fail) -> bool {
+    ui::pause_stage();
+    let go = ui::get_ready_and_confirm(&f.advice, &[], &[], "Повторить");
+    ui::resume_stage();
+    go
+}
+
+async fn retry_network(args: &Args, f: &Fail) -> bool {
+    ui::pause_stage();
+    let go = vpn_handoff(
+        args,
+        &f.advice,
+        &[],
+        &["Переключите VPN, вернитесь в Minis и нажмите «Повторить»."],
+        "Повторить",
+    )
+    .await;
+    ui::resume_stage();
+    go
+}
+
+async fn check_device(args: &Args) -> Result<preflight::Checked> {
+    let mut first = true;
+    loop {
+        let outcome = if first {
+            preflight::run(args).await
+        } else {
+            preflight::reach_device(args).await
+        };
+        first = false;
+        match outcome {
+            Ok(checked) => return Ok(checked),
+            Err(f) => {
+                if !retryable(&f) || !retry_device(&f) {
+                    return Err(f);
+                }
+            }
+        }
+    }
+}
+
+async fn check_network(args: &Args) -> Result<()> {
+    loop {
+        match preflight::check_online(args).await {
+            Ok(()) => return Ok(()),
+            Err(f) => {
+                if !retryable(&f) || !retry_network(args, &f).await {
+                    return Err(f);
+                }
+            }
+        }
+    }
+}
+
+async fn open_tunnel(args: &Args, pairing_path: &Path) -> Result<tunnel::Connection> {
+    loop {
+        match tunnel::open(args.device, pairing_path).await {
+            Ok(connection) => return Ok(connection),
+            Err(f) => {
+                if !retryable(&f) || !retry_device(&f) {
+                    return Err(f);
+                }
+            }
+        }
+    }
+}
+
+async fn download_ipa(args: &Args) -> Result<PathBuf> {
+    let downloads = args
+        .ipa
+        .as_deref()
+        .is_none_or(|ipa| ipa.starts_with("http"));
+    loop {
+        match sign::fetch_ipa(args).await {
+            Ok(path) => return Ok(path),
+            Err(f) => {
+                if !downloads || !retryable(&f) || !retry_network(args, &f).await {
+                    return Err(f);
+                }
+            }
+        }
+    }
+}
+
 async fn pipeline(args: &Args) -> Result<()> {
-    std::fs::create_dir_all(&args.home)
-        .map_err(|e| Fail::new(format!("Couldn't create {}.", args.home.display()), e.to_string()))?;
+    std::fs::create_dir_all(&args.home).map_err(|e| {
+        Fail::new(
+            format!("Не удалось создать {}.", args.home.display()),
+            e.to_string(),
+        )
+    })?;
 
     let devmode = args.command == Command::DeveloperMode;
     match args.command {
+        Command::All if args.ipa.is_some() => ui::plan(&APP_STEP_NAMES, APP_STEP_NAMES.len()),
         Command::All => ui::plan(&STEP_NAMES, STAGES),
-        Command::Check => ui::plan(&STEP_NAMES[..1], STAGES),
-        Command::Connect => ui::plan(&STEP_NAMES[..3], STAGES),
+        Command::Check => ui::plan(&CHECK_NAMES, CHECK_NAMES.len()),
+        Command::Connect => ui::plan(&STEP_NAMES[..3], 3),
         Command::DeveloperMode => {
             let mut names = STEP_NAMES[..3].to_vec();
             names.push(DEVMODE_NAME);
             ui::plan(&names, DEVMODE_STAGES);
         }
     }
-    // Before the request, a failure also says what siboot can't do without the
-    // tunnel.
-    let note = |f: Fail| if devmode { devmode::unreachable_note(f) } else { f };
+    let note = |f: Fail| {
+        if devmode {
+            devmode::unreachable_note(f)
+        } else {
+            f
+        }
+    };
 
-    if devmode {
-        ui::step(1, "Checking LocalDevVPN and this iPhone");
-    } else {
-        ui::step(1, "Checking LocalDevVPN, this iPhone and the internet");
+    if args.command == Command::All && !start_gate(args.ipa.is_some()) {
+        return Err(Fail::by_user("Остановлено до начала установки."));
     }
-    let checked = preflight::run(args).await.map_err(note)?;
-    ui::done(if checked.online { "online, and the iPhone answers" } else { "the iPhone answers" });
+
+    ui::step(1, "Проверка LocalDevVPN и iPhone");
+    let checked = check_device(args).await.map_err(note)?;
+    ui::done("iPhone отвечает");
+
     if args.command == Command::Check {
-        ui::finish("Ready", &["Run siboot to install SideInstaller."]);
+        ui::step(2, "Проверка GitHub и сервера входа Apple");
+        check_network(args).await?;
+        ui::done("интернет доступен");
+        ui::finish(
+            "Всё готово",
+            &["Запустите siboot, чтобы установить SideInstaller."],
+        );
         return Ok(());
     }
-    // The rest dials where the iPhone answered, which isn't the port asked
-    // for when its pairing service started on another one.
     let args = &Args {
         device: checked.device,
         ..args.clone()
     };
 
-    ui::step(2, "Pairing this iPhone with siboot");
+    ui::step(2, "Сопряжение iPhone с siboot");
     let pairing_path = args.pairing_path();
     let source = pairing::ensure(args, &pairing_path).await.map_err(note)?;
     ui::done(match source {
-        pairing::Source::Saved => "the saved pairing still works",
-        pairing::Source::Rootshell => "taken from rootshell",
-        pairing::Source::Minis => "paired here in Minis",
+        pairing::Source::Saved => "сохранённое сопряжение работает",
+        pairing::Source::Rootshell => "получено из rootshell",
+        pairing::Source::Minis => "сопряжено в Minis",
     });
 
-    ui::step(3, "Connecting to this iPhone through LocalDevVPN");
-    let mut connection = tunnel::open(args.device, &pairing_path).await.map_err(note)?;
+    ui::step(3, "Подключение к iPhone через LocalDevVPN");
+    let mut connection = open_tunnel(args, &pairing_path).await.map_err(note)?;
     let device = connection.describe().await.map_err(note)?;
     ui::ok(&format!(
-        "{} — {} on iOS {}",
+        "{} — {}, iOS {}",
         device.name, device.product_type, device.ios_version
     ));
-    ui::detail(&format!("UDID {}", device.udid));
+    ui::detail(&format!("UDID: {}", device.udid));
     ui::done(&format!("{} · iOS {}", device.name, device.ios_version));
     if args.command == Command::Connect {
-        ui::finish("The tunnel works", &["This iPhone accepts the pairing file, and the tunnel opens with it."]);
+        ui::finish(
+            "Туннель работает",
+            &["iPhone принимает файл сопряжения, туннель открыт."],
+        );
         return Ok(());
     }
     if devmode {
-        ui::step(4, "Asking this iPhone for Developer Mode");
+        ui::step(4, "Запрос режима разработчика на iPhone");
         return developer_mode(args, &mut connection).await;
     }
-    // The connection is closed here: iOS drops an idle tunnel during sign-in and
-    // signing anyway, so a fresh one is opened to install (as Side by Side does).
     drop(connection);
 
-    ui::step(4, "Signing in to your Apple Account");
+    ui::step(4, "Переключение VPN и проверка интернета");
+    if !vpn_handoff(
+        args,
+        "Настройте интернет для входа в Apple ID",
+        &[
+            "Отключите LocalDevVPN, если он мешает обычному интернету.",
+            "При необходимости включите обычный VPN для Apple и GitHub.",
+        ],
+        &HANDOFF_NOTES,
+        "Продолжить",
+    )
+    .await
+    {
+        return Err(Fail::by_user("Остановлено до входа в Apple ID."));
+    }
+    check_network(args).await?;
+    ui::done("интернет доступен, GitHub и сервер Apple отвечают");
+
+    ui::step(5, "Вход в учётную запись Apple");
     let mut session = account::sign_in(args).await?;
     ui::done(&session.team);
 
-    ui::step(5, "Signing SideInstaller for this iPhone");
-    let ipa = sign::fetch_ipa(args).await?;
+    ui::step(
+        6,
+        if args.ipa.is_some() {
+            "Подпись приложения для этого iPhone"
+        } else {
+            "Подпись SideInstaller для этого iPhone"
+        },
+    );
+    let ipa = download_ipa(args).await?;
     let signed = sign::sign(&mut session, &ipa, &device).await?;
     ui::done(&match &signed.version {
-        Some(version) => format!("{} {version} signed", signed.name),
-        None => format!("{} signed", signed.name),
+        Some(version) => format!("{} {version}: подписано", signed.name),
+        None => format!("{}: подписано", signed.name),
     });
 
-    ui::step(6, "Installing it");
-    let mut connection = tunnel::open(args.device, &pairing_path).await?;
-    let uploaded = install::install(&mut connection, &signed.app_dir).await?;
-    ui::ok(&format!("{} installed ({})", signed.name, signed.bundle_id));
-    ui::done(&format!("installed · {uploaded}"));
-
-    ui::step(7, "Handing SideInstaller the pairing");
-    seed::hand_over(&mut connection, &signed.bundle_id, &pairing_path).await?;
-    ui::done("SideInstaller has the pairing");
-
-    // Its own URL scheme (ios-app/Info.plist): the page's button opens it.
-    ui::link("Open SideInstaller", "sideinstaller://");
-    ui::finish(
-        "SideInstaller is installed",
+    if !vpn_handoff(
+        args,
+        "Подготовьте повторное подключение к iPhone",
         &[
-            "Open it from your Home Screen. The first time, iOS asks you to trust your Apple \
-             Account: Settings › General › VPN & Device Management.",
+            "Отключите обычный VPN, если он включён.",
+            "Снова включите LocalDevVPN.",
+        ],
+        &HANDOFF_NOTES,
+        "Продолжить",
+    )
+    .await
+    {
+        return Err(Fail::by_user(if args.ipa.is_some() {
+            "Остановлено до установки приложения."
+        } else {
+            "Остановлено до установки SideInstaller."
+        }));
+    }
+
+    ui::step(
+        7,
+        if args.ipa.is_some() {
+            "Установка приложения на iPhone"
+        } else {
+            "Копирование файлов на iPhone"
+        },
+    );
+    let mut connection = open_tunnel(args, &pairing_path).await?;
+    let uploaded = install::install(&mut connection, &signed.app_dir).await?;
+    ui::ok(&format!(
+        "{} установлено ({})",
+        signed.name, signed.bundle_id
+    ));
+    ui::done(&format!("установлено · {uploaded}"));
+
+    if args.ipa.is_some() {
+        ui::finish(
+            &format!("{} установлено", signed.name),
+            &[
+                "Откройте приложение с главного экрана. При первом запуске подтвердите доверие к учётной записи Apple: Настройки › Основные › VPN и управление устройством.",
+                team::lasts(session.kind, session.first),
+            ],
+        );
+        return Ok(());
+    }
+
+    ui::step(8, "Передача сопряжения в SideInstaller");
+    seed::hand_over(&mut connection, &signed.bundle_id, &pairing_path).await?;
+    ui::done("SideInstaller получил файл сопряжения");
+
+    ui::link("Открыть SideInstaller", "sideinstaller://");
+    ui::finish(
+        "SideInstaller установлен",
+        &[
+            "Откройте приложение с главного экрана. При первом запуске подтвердите доверие к учётной записи Apple: Настройки › Основные › VPN и управление устройством.",
             team::lasts(session.kind, session.first),
         ],
     );
     Ok(())
 }
 
-/// Step 4 of `siboot developer-mode`, through the open tunnel.
+async fn vpn_handoff(
+    args: &Args,
+    title: &str,
+    steps: &[&str],
+    notes: &[&str],
+    button: &str,
+) -> bool {
+    let bridge = Bridge::from_env();
+    let keepalive = match KeepAlive::start(&bridge, &args.home, keepalive::PAIRING_SECONDS).await {
+        Ok(player) => Some(player),
+        Err(error) => {
+            ui::warn(&format!(
+                "Не удалось запустить фоновый плеер; переключать VPN небезопасно: {error}"
+            ));
+            return false;
+        }
+    };
+    let confirmed = ui::get_ready_and_confirm(title, steps, notes, button);
+    if let Some(player) = keepalive {
+        player.stop().await;
+    }
+    confirmed
+}
+
 async fn developer_mode(args: &Args, connection: &mut tunnel::Connection) -> Result<()> {
-    let request = if args.turn_on { devmode::Request::TurnOn } else { devmode::Request::Show };
-    let confirm = || ui::confirm("turn it on now?", false);
+    let request = if args.turn_on {
+        devmode::Request::TurnOn
+    } else {
+        devmode::Request::Show
+    };
+    let confirm = || ui::confirm("включить режим сейчас?", false);
     let outcome = devmode::run(connection, request, confirm).await?;
-    let unlock = "Once you unlock it, tap Turn On.";
+    let unlock = "Разблокируйте iPhone и нажмите «Включить»";
     match outcome {
         devmode::Outcome::AlreadyOn => {
-            ui::done("already on");
-            ui::finish("Developer Mode is already on", &["So nothing was sent."]);
+            ui::done("уже включён");
+            ui::finish(
+                "Режим разработчика уже включён",
+                &["Запросы не отправлялись."],
+            );
         }
         devmode::Outcome::Shown => {
-            ui::done("the switch now shows in Settings");
+            ui::done("переключатель появился в Настройках");
             ui::finish(
-                "Developer Mode is in Settings",
+                "Режим разработчика доступен в Настройках",
                 &[
-                    "It now shows under Settings › Privacy & Security, near the bottom. Turn it \
-                     on there; iOS restarts to finish.",
+                    "Переключатель находится внизу раздела Настройки › Конфиденциальность и безопасность. Включите его; iPhone перезагрузится.",
                     unlock,
                 ],
             );
         }
         devmode::Outcome::ShownForPasscode => {
-            ui::done("the switch now shows in Settings");
+            ui::done("переключатель появился в Настройках");
             ui::finish(
-                "Developer Mode is in Settings",
+                "Режим разработчика доступен в Настройках",
                 &[
-                    "iOS turns Developer Mode on from here only while the iPhone has no passcode, \
-                     so siboot showed it under Settings › Privacy & Security instead. Turn it on \
-                     there; iOS restarts to finish.",
+                    "iOS позволяет включить режим таким способом только без код-пароля, поэтому siboot показал переключатель в разделе Настройки › Конфиденциальность и безопасность. Включите его там; iPhone перезагрузится.",
                     unlock,
                 ],
             );
         }
         devmode::Outcome::TurningOn => {
-            ui::done("set to turn on");
+            ui::done("включение запрошено");
             ui::finish(
-                "Developer Mode is turning on",
-                &["This iPhone restarts now, and Minis stops with it.", unlock],
+                "Включение режима разработчика",
+                &["iPhone сейчас перезагрузится, Minis остановится.", unlock],
             );
         }
         devmode::Outcome::HungUp => {
-            ui::done("the iPhone hung up, restarting");
+            ui::done("iPhone отключился и перезагружается");
             ui::finish(
-                "This iPhone is restarting",
+                "iPhone перезагружается",
                 &[
-                    "It hung up right after the request, as it does when it restarts to turn \
-                     Developer Mode on.",
+                    "Соединение прервалось сразу после запроса — так происходит при перезагрузке для включения режима разработчика.",
                     unlock,
-                    "If it doesn't restart, run siboot developer-mode again.",
+                    "Если iPhone не перезагрузится, снова запустите siboot developer-mode.",
                 ],
             );
         }
@@ -643,7 +833,9 @@ mod tests {
         let args = parse("");
         assert_eq!(args.command, Command::All);
         assert_eq!(args.device.to_string(), "10.7.0.1:49152");
-        assert!(args.pairing_path().ends_with(".siboot/rp_pairing_file.plist"));
+        assert!(args
+            .pairing_path()
+            .ends_with(".siboot/rp_pairing_file.plist"));
     }
 
     #[test]
@@ -660,6 +852,15 @@ mod tests {
         assert_eq!(parse("--terminal").web, Some(false));
         assert_eq!(parse("--plain").web, None);
         assert_eq!(parse("").web, None);
+    }
+
+    #[test]
+    fn only_real_failures_offer_a_retry() {
+        assert!(retryable(&Fail::new("Нет связи с iPhone.", "timeout")));
+        assert!(!retryable(&Fail::by_user(
+            "Остановлено до входа в Apple ID."
+        )));
+        assert!(!retryable(&Fail::known(preflight::OLD_MINIS)));
     }
 
     #[test]
@@ -684,7 +885,10 @@ mod tests {
             "--repair",
             "--advertiser minis",
         ] {
-            assert!(parse_args(line.split_whitespace().map(String::from)).is_err(), "{line}");
+            assert!(
+                parse_args(line.split_whitespace().map(String::from)).is_err(),
+                "{line}"
+            );
         }
     }
 }

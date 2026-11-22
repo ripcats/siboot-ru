@@ -1,0 +1,71 @@
+name: Build Minis binary
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-minis.yml"
+      - "minis/**"
+      - "rootshell/**"
+      - "SideInstaller"
+  pull_request:
+    paths:
+      - ".github/workflows/build-minis.yml"
+      - "minis/**"
+      - "rootshell/**"
+      - "SideInstaller"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Native ARM avoids a cross C toolchain for aws-lc-sys and builds the same
+    # static musl target that Open Minis runs.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out siboot and SideInstaller
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake make musl-tools perl
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl,wasm32-wasip1
+
+      - name: Build static ARM64 binary
+        working-directory: minis
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          RUSTFLAGS: -C target-feature=+crt-static -C relocation-model=static
+        run: cargo build --release --locked --target aarch64-unknown-linux-musl
+
+      - name: Build rootshell pairing WASM
+        working-directory: rootshell
+        run: cargo build --release --locked --target wasm32-wasip1
+
+      - name: Prepare checksummed artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/siboot-artifact"
+          install -m 755 minis/target/aarch64-unknown-linux-musl/release/siboot \
+            "$RUNNER_TEMP/siboot-artifact/siboot-aarch64"
+          install -m 644 rootshell/target/wasm32-wasip1/release/siboot-pair.wasm \
+            "$RUNNER_TEMP/siboot-artifact/siboot-pair.wasm"
+          cd "$RUNNER_TEMP/siboot-artifact"
+          sha256sum siboot-aarch64 siboot-pair.wasm > SHA256SUMS
+          stat -c '%s' siboot-aarch64 > SIZE
+
+      - name: Upload ARM64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: siboot-aarch64
+          path: ${{ runner.temp }}/siboot-artifact/
+          if-no-files-found: error
+          retention-days: 14

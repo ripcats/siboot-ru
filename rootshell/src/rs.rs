@@ -1,10 +1,3 @@
-//! rootshell's socket ABI (`rootshell_socket_*`, WASM import module
-//! `rootshell_socket`), as kitknox/rootshell's `wasm/README.md` documents it.
-//!
-//! Every call blocks until Network.framework answers. TCP listen/accept is an
-//! `NWListener`; a UDP `sendto` opens an `NWConnection` to the destination.
-//! There is no poll, no setsockopt, and `getsockname` always says 0.0.0.0.
-
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -35,9 +28,6 @@ unsafe extern "C" {
     fn rootshell_socket_close(fd: i32) -> i32;
 }
 
-// Off WASM there is no rootshell. For `cargo test` the same calls run on the
-// host's own sockets: TCP on loopback only, and datagrams counted as sent and
-// dropped, so a test never announces "Pair with …" to iPhones on the network.
 #[cfg(not(target_arch = "wasm32"))]
 mod host {
     use std::collections::HashMap;
@@ -52,7 +42,6 @@ mod host {
     const EIO: i32 = 29;
 
     enum Entry {
-        /// A TCP socket and the port it was bound to (0 until then).
         Unbound(u16),
         Listener(TcpListener),
         Stream(TcpStream),
@@ -79,7 +68,6 @@ mod host {
         }
     }
 
-    /// A handle to the connection, so blocking I/O doesn't hold the table.
     fn stream(fd: i32) -> Result<TcpStream, i32> {
         match table().lock().unwrap().get(&fd) {
             Some(Entry::Stream(s)) => s.try_clone().map_err(|e| errno(&e)),
@@ -87,7 +75,6 @@ mod host {
         }
     }
 
-    /// The port a listener got: tests listen on port 0.
     #[cfg(test)]
     pub fn local_port(fd: i32) -> u16 {
         match table().lock().unwrap().get(&fd) {
@@ -97,7 +84,11 @@ mod host {
     }
 
     pub unsafe fn rootshell_socket_socket(_domain: i32, kind: i32, fd_out: *mut i32) -> i32 {
-        let entry = if kind == super::SOCK_STREAM { Entry::Unbound(0) } else { Entry::Datagram };
+        let entry = if kind == super::SOCK_STREAM {
+            Entry::Unbound(0)
+        } else {
+            Entry::Datagram
+        };
         unsafe { *fd_out = insert(entry) };
         0
     }
@@ -147,7 +138,12 @@ mod host {
         }
     }
 
-    pub unsafe fn rootshell_socket_send(fd: i32, buf: *const u8, len: i32, sent_out: *mut u32) -> i32 {
+    pub unsafe fn rootshell_socket_send(
+        fd: i32,
+        buf: *const u8,
+        len: i32,
+        sent_out: *mut u32,
+    ) -> i32 {
         let data = unsafe { std::slice::from_raw_parts(buf, len as usize) };
         match stream(fd).and_then(|mut s| s.write(data).map_err(|e| errno(&e))) {
             Ok(n) => {
@@ -158,7 +154,12 @@ mod host {
         }
     }
 
-    pub unsafe fn rootshell_socket_recv(fd: i32, buf: *mut u8, len: i32, recv_out: *mut u32) -> i32 {
+    pub unsafe fn rootshell_socket_recv(
+        fd: i32,
+        buf: *mut u8,
+        len: i32,
+        recv_out: *mut u32,
+    ) -> i32 {
         let room = unsafe { std::slice::from_raw_parts_mut(buf, len as usize) };
         match stream(fd).and_then(|mut s| s.read(room).map_err(|e| errno(&e))) {
             Ok(n) => {
@@ -196,7 +197,6 @@ mod host {
 #[cfg(not(target_arch = "wasm32"))]
 use host::*;
 
-/// The ABI's errno values (WASI's numbering).
 pub fn errno_text(e: i32) -> String {
     let name = match e {
         1 => "EADDRINUSE",
@@ -223,7 +223,6 @@ fn check(what: &str, e: i32) -> io::Result<()> {
     }
 }
 
-/// A 16-byte `sockaddr_in`, family in the first byte (the ABI's layout).
 pub fn sockaddr_in(ip: [u8; 4], port: u16) -> [u8; 16] {
     let mut out = [0u8; 16];
     out[0] = AF_INET as u8;
@@ -232,7 +231,6 @@ pub fn sockaddr_in(ip: [u8; 4], port: u16) -> [u8; 16] {
     out
 }
 
-/// A socket fd in the ABI's own fd space, closed on drop.
 #[derive(Debug)]
 pub struct Socket {
     fd: i32,
@@ -241,38 +239,51 @@ pub struct Socket {
 impl Socket {
     pub fn new(kind: i32) -> io::Result<Self> {
         let mut fd = -1;
-        check("socket", unsafe { rootshell_socket_socket(AF_INET, kind, &mut fd) })?;
+        check("socket", unsafe {
+            rootshell_socket_socket(AF_INET, kind, &mut fd)
+        })?;
         Ok(Self { fd })
     }
 
-    /// A TCP listener on `port`, on every interface.
     pub fn listen(port: u16) -> io::Result<Self> {
         let s = Self::new(SOCK_STREAM)?;
         let addr = sockaddr_in([0, 0, 0, 0], port);
-        check("bind", unsafe { rootshell_socket_bind(s.fd, addr.as_ptr(), 16) })?;
+        check("bind", unsafe {
+            rootshell_socket_bind(s.fd, addr.as_ptr(), 16)
+        })?;
         check("listen", unsafe { rootshell_socket_listen(s.fd, 4) })?;
         Ok(s)
     }
 
-    /// Blocks until a connection arrives.
     pub fn accept(&self) -> io::Result<Stream> {
         let mut fd = -1;
-        check("accept", unsafe { rootshell_socket_accept(self.fd, &mut fd) })?;
-        Ok(Stream { socket: Socket { fd } })
+        check("accept", unsafe {
+            rootshell_socket_accept(self.fd, &mut fd)
+        })?;
+        Ok(Stream {
+            socket: Socket { fd },
+        })
     }
 
-    /// One UDP datagram on a socket of its own, then closed: a flow
-    /// Network.framework has had for a few seconds can stop completing sends
-    /// to a multicast address, so none is kept.
     pub fn send_datagram(data: &[u8], ip: [u8; 4], port: u16) -> io::Result<()> {
         let s = Self::new(SOCK_DGRAM)?;
         let addr = sockaddr_in(ip, port);
         let mut sent = 0u32;
         check("sendto", unsafe {
-            rootshell_socket_sendto(s.fd, data.as_ptr(), data.len() as i32, addr.as_ptr(), 16, &mut sent)
+            rootshell_socket_sendto(
+                s.fd,
+                data.as_ptr(),
+                data.len() as i32,
+                addr.as_ptr(),
+                16,
+                &mut sent,
+            )
         })?;
         if sent as usize != data.len() {
-            return Err(io::Error::other(format!("sendto sent {sent} of {} bytes", data.len())));
+            return Err(io::Error::other(format!(
+                "sendto sent {sent} of {} bytes",
+                data.len()
+            )));
         }
         Ok(())
     }
@@ -280,7 +291,6 @@ impl Socket {
 
 #[cfg(test)]
 impl Socket {
-    /// The port a listener got (tests listen on port 0).
     pub fn local_port(&self) -> u16 {
         host::local_port(self.fd)
     }
@@ -294,22 +304,20 @@ impl Drop for Socket {
     }
 }
 
-/// A connected TCP socket as tokio's async traits, for idevice. Every call
-/// blocks and is then ready, which is fine under a one-task executor: the
-/// pairing conversation is strictly one message after another.
 #[derive(Debug)]
 pub struct Stream {
     socket: Socket,
 }
 
 impl Stream {
-    /// One line, without its `\n`, of at most `max` bytes.
     pub fn read_line(&self, max: usize) -> io::Result<String> {
         let mut line = Vec::new();
         let mut byte = [0u8; 1];
         while line.len() < max {
             let mut got = 0u32;
-            check("recv", unsafe { rootshell_socket_recv(self.socket.fd, byte.as_mut_ptr(), 1, &mut got) })?;
+            check("recv", unsafe {
+                rootshell_socket_recv(self.socket.fd, byte.as_mut_ptr(), 1, &mut got)
+            })?;
             if got == 0 || byte[0] == b'\n' {
                 break;
             }
@@ -334,23 +342,39 @@ impl Stream {
 }
 
 impl AsyncRead for Stream {
-    fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let room = buf.initialize_unfilled();
         let mut got = 0u32;
-        let e = unsafe { rootshell_socket_recv(self.socket.fd, room.as_mut_ptr(), room.len() as i32, &mut got) };
+        let e = unsafe {
+            rootshell_socket_recv(
+                self.socket.fd,
+                room.as_mut_ptr(),
+                room.len() as i32,
+                &mut got,
+            )
+        };
         if let Err(err) = check("recv", e) {
             return Poll::Ready(Err(err));
         }
-        // Zero bytes: the peer closed.
         buf.advance(got as usize);
         Poll::Ready(Ok(()))
     }
 }
 
 impl AsyncWrite for Stream {
-    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let mut sent = 0u32;
-        let e = unsafe { rootshell_socket_send(self.socket.fd, data.as_ptr(), data.len() as i32, &mut sent) };
+        let e = unsafe {
+            rootshell_socket_send(self.socket.fd, data.as_ptr(), data.len() as i32, &mut sent)
+        };
         Poll::Ready(check("send", e).map(|()| sent as usize))
     }
 

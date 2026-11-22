@@ -1,14 +1,3 @@
-//! Step 1: is everything the later steps need actually here?
-//!
-//! Each check names what to change when it fails: Open Minis, which has to be
-//! 1.16 or later, the internet, for sign-in and the download, and LocalDevVPN,
-//! which carries everything to this iPhone. `siboot check` also says whether
-//! this Open Minis can pair the iPhone.
-//!
-//! The iPhone's pairing service is nearly always on port 49152, but not
-//! always. When it isn't there, this step finds the port it's on ([`reach`]),
-//! and the later steps dial that one.
-
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
@@ -25,89 +14,78 @@ use crate::bridge::{Bridge, BridgeError};
 use crate::fail::{chain, Fail, Result};
 use crate::{ui, Args, Command};
 
-/// Open Minis in the App Store app, for the page's button. The page hands
-/// links that aren't http to iOS, so this opens the App Store itself.
 pub const MINIS_APP_STORE: &str = "itms-apps://apps.apple.com/app/id6759188481";
 
-/// What an Open Minis older than 1.16 is told.
-pub const OLD_MINIS: &str = "This Open Minis is older than 1.16, and siboot needs Open Minis 1.16 \
-     or later: it's the first that can pair this iPhone. Update Open Minis in the App Store, open \
-     it again and run siboot.";
+pub const OLD_MINIS: &str = "Эта версия Open Minis старее 1.16. Для сопряжения iPhone нужна версия 1.16 или новее. Обновите Open Minis в App Store, откройте приложение и снова запустите siboot.";
 
-/// What step 1 found.
 pub struct Checked {
-    /// The internet was checked too.
-    pub online: bool,
-    /// Where the iPhone's pairing service answered: the address siboot was
-    /// given, or the port the service turned out to be on.
     pub device: SocketAddr,
 }
 
 pub async fn run(args: &Args) -> Result<Checked> {
     let in_minis = crate::web::available() || std::env::var_os("SIBOOT_MINIS_BIN").is_some();
     if in_minis {
-        ui::activity("checking this Open Minis");
+        ui::activity("проверка Open Minis");
         check_minis(&Bridge::from_env()).await?;
-        ui::ok("this Open Minis is 1.16 or later");
+        ui::ok("Open Minis версии 1.16 или новее");
     }
-    // The tunnel stays on this iPhone; sign-in and the download don't.
-    let online = args.command == Command::All || args.command == Command::Check;
-    if online {
-        check_online(args).await?;
-    }
-    ui::activity(&format!("reaching this iPhone at {}", args.device));
+    reach_device(args).await
+}
+
+pub async fn reach_device(args: &Args) -> Result<Checked> {
+    ui::activity(&format!("подключение к iPhone по адресу {}", args.device));
     let (device, found) = reach(args.device, DYNAMIC_PORTS, &KNOCKS).await?;
     ui::ok(&format!(
-        "this iPhone answers on {device} (RPPairing, wire protocol {})",
+        "iPhone отвечает по адресу {device} (RPPairing, версия протокола {})",
         found.wire_version
     ));
     if let Some(name) = found.name {
-        ui::detail(&format!("it calls itself \"{name}\""));
+        ui::detail(&format!("имя устройства: «{name}»"));
     }
     if args.command == Command::Check {
-        ui::activity("checking that Open Minis can pair this iPhone");
+        ui::activity("проверка возможности сопряжения через Open Minis");
         match crate::pairing::can_pair_here(&crate::bridge::Bridge::from_env()).await {
-            Ok(true) => ui::ok("Open Minis can pair this iPhone, and post the code as a notification"),
+            Ok(true) => {
+                ui::ok("Open Minis может выполнить сопряжение и показать код в уведомлении")
+            }
             Ok(false) => {
-                ui::ok("Open Minis can pair this iPhone");
-                ui::warn("Minis's notifications are off, so the pairing code will show only in Minis.");
+                ui::ok("Open Minis может выполнить сопряжение с iPhone");
+                ui::warn(
+                    "Уведомления Minis выключены; код сопряжения будет виден только в приложении.",
+                );
             }
             Err(why) => ui::warn(&format!(
-                "{why} The pairing then has to come from a file saved before, or from rootshell."
+                "{why} Используйте ранее сохранённый файл сопряжения или rootshell."
             )),
         }
     }
-    Ok(Checked { online, device })
+    Ok(Checked { device })
 }
 
-/// Stop in an Open Minis older than 1.16. Minis doesn't tell the shell its
-/// version, but pairing needs `minis-bonjour`, which came with 1.16 (App
-/// Store, 2026-11-14): a Minis without it is older. Any other answer, a
-/// refusal included, comes from 1.16 or later, and is step 2's to explain.
-/// Only run inside Minis (`minis-open` on the PATH): elsewhere there's no
-/// `minis-bonjour` either.
 pub async fn check_minis(bridge: &Bridge) -> Result<()> {
     match bridge.bonjour_types().await {
         Err(BridgeError::Missing(_)) => {
-            ui::link("Update Open Minis", MINIS_APP_STORE);
+            ui::link("Обновить Open Minis", MINIS_APP_STORE);
             Err(Fail::known(OLD_MINIS))
         }
         _ => Ok(()),
     }
 }
 
-/// GitHub (the IPA) and Apple's sign-in server answer over TLS. Apple's
-/// `gsa.apple.com` chains to Apple Root CA, which Alpine's bundle lacks, so it's
-/// trusted here as isideload's GrandSlam client trusts it.
-async fn check_online(args: &Args) -> Result<()> {
+pub async fn check_online(args: &Args) -> Result<()> {
     let apple_root = reqwest::Certificate::from_der(isideload::sideload::cert_identity::APPLE_ROOT)
-        .map_err(|e| Fail::new("Couldn't load Apple's root certificate.", e.to_string()))?;
+        .map_err(|e| {
+            Fail::new(
+                "Не удалось загрузить корневой сертификат Apple.",
+                e.to_string(),
+            )
+        })?;
     let client = reqwest::Client::builder()
         .user_agent(format!("siboot/{}", crate::VERSION))
         .timeout(Duration::from_secs(20))
         .add_root_certificate(apple_root)
         .build()
-        .map_err(|e| Fail::new("Couldn't start an HTTPS client.", e.to_string()))?;
+        .map_err(|e| Fail::new("Не удалось запустить HTTPS-клиент.", e.to_string()))?;
 
     let downloads = args
         .ipa
@@ -115,36 +93,36 @@ async fn check_online(args: &Args) -> Result<()> {
         .is_none_or(|ipa| ipa.starts_with("http"));
     if downloads {
         let url = args.ipa.as_deref().unwrap_or(crate::sign::RELEASE_IPA);
-        ui::activity("reaching GitHub");
+        let product = if args.ipa.is_some() {
+            "указанный IPA"
+        } else {
+            "SideInstaller"
+        };
+        ui::activity("проверка доступности GitHub");
         match client.head(url).send().await {
-            Ok(r) if r.status().is_success() => {
-                ui::ok("GitHub answers, and the SideInstaller release is there")
-            }
+            Ok(r) if r.status().is_success() => ui::ok(&format!("файл {product} доступен")),
             Ok(r) => ui::warn(&format!(
-                "GitHub answered {} for the SideInstaller release.",
-                r.status()
+                "Сервер ответил кодом {} при проверке {product}.",
+                r.status(),
             )),
             Err(e) => {
                 return Err(Fail::new(
-                    "Couldn't reach GitHub, where SideInstaller is downloaded from. Check the \
-                     internet connection.",
+                    format!("Не удалось загрузить {product}. Проверьте интернет-соединение."),
                     crate::error_text::error_text(&e),
                 ))
             }
         }
     }
-    // Any HTTP answer proves DNS, the route and the certificate chain.
-    ui::activity("reaching Apple's sign-in server");
+    ui::activity("проверка сервера входа Apple");
     match client
         .get("https://gsa.apple.com/grandslam/GsService2/lookup")
         .send()
         .await
     {
-        Ok(_) => ui::ok("Apple's sign-in server answers"),
+        Ok(_) => ui::ok("сервер входа Apple доступен"),
         Err(e) => {
             return Err(Fail::new(
-                "Couldn't reach Apple's sign-in server (gsa.apple.com). Check the internet \
-                 connection.",
+                "Не удалось подключиться к серверу входа Apple (gsa.apple.com). Проверьте интернет-соединение.",
                 crate::error_text::error_text(&e),
             ))
         }
@@ -176,26 +154,9 @@ impl Found {
     }
 }
 
-/// The ports iOS hands a listener that asks for any free one
-/// (`net.inet.ip.portrange.first` to `.last`).
 const DYNAMIC_PORTS: RangeInclusive<u16> = 49152..=65535;
-/// lockdownd's: the one fixed port in that range, and not the pairing service.
 const LOCKDOWN_PORT: u16 = 62078;
 
-/// Dial the pairing service at `addr`. When LocalDevVPN carries the
-/// connection but nothing there answers as the service, look for it on the
-/// iPhone's other `ports`.
-///
-/// The service, remotepairingd's listener, takes whatever port iOS hands it
-/// when it starts, and iOS hands TCP ports out in order from 49152, not at
-/// random (`net.inet.tcp.randomize_ports` is 0, as on a Mac). Started first
-/// after a restart, it gets 49152, which is why SideInstaller and StikDebug
-/// dial that one blind. Started after something else, it gets a later one: on
-/// 2026-11-18 one iPhone on a Wi-Fi advertised it (`_remotepairing._tcp`) on
-/// 55021, while siboot users with Developer Mode on were refused at
-/// 10.7.0.1:49152. Minis's shell can't browse Bonjour for that advert, so
-/// siboot knocks on each port through LocalDevVPN instead. A closed port
-/// refuses at once, so it takes seconds; from a Mac over Wi-Fi, 9 s.
 async fn reach(
     addr: SocketAddr,
     ports: impl IntoIterator<Item = u16>,
@@ -206,8 +167,11 @@ async fn reach(
         Err(Miss::Unreachable(f)) => return Err(f),
         Err(Miss::Elsewhere(f)) => f,
     };
-    ui::detail(&format!("no pairing service at {addr}: {}", missed.raw));
-    ui::status("looking for this iPhone's pairing service on its other ports");
+    ui::detail(&format!(
+        "по адресу {addr} служба сопряжения не найдена: {}",
+        missed.raw
+    ));
+    ui::status("поиск службы сопряжения iPhone на других портах");
     let ports = others(addr.port(), ports);
     let count = ports.len();
     let started = Instant::now();
@@ -217,7 +181,7 @@ async fn reach(
     match search {
         Search::Found(moved, found, knocked) => {
             ui::detail(&format!(
-                "found it on port {} after {knocked} of {count} ports, in {took:.1} s",
+                "служба найдена на порту {} (проверено портов: {knocked} из {count}, время: {took:.1} с)",
                 moved.port()
             ));
             Ok((moved, found))
@@ -235,7 +199,6 @@ async fn reach(
     }
 }
 
-/// `ports` without the one already tried and lockdownd's, in order.
 fn others(tried: u16, ports: impl IntoIterator<Item = u16>) -> Vec<u16> {
     ports
         .into_iter()
@@ -245,36 +208,29 @@ fn others(tried: u16, ports: impl IntoIterator<Item = u16>) -> Vec<u16> {
 
 fn listed(ports: &[u16]) -> String {
     if ports.is_empty() {
-        return "none".into();
+        return "нет".into();
     }
     let mut sorted = ports.to_vec();
     sorted.sort_unstable();
-    sorted.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+    sorted
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// Why the pairing service didn't answer at an address.
 enum Miss {
-    /// LocalDevVPN carried the connection, but the service isn't there: the
-    /// port refused, or something else took it. It can be on another port.
-    /// The advice is for when it isn't on any.
     Elsewhere(Fail),
-    /// Nothing gets through to the iPhone.
     Unreachable(Fail),
 }
 
-/// Ask the iPhone's RPPairing listener for its handshake, as the first message
-/// of a connection does. A reply proves the VPN route, Developer Mode and the
-/// service all at once.
 async fn probe(addr: SocketAddr) -> std::result::Result<Found, Miss> {
     let stream = match timeout(Duration::from_secs(8), TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => {
             return Err(Miss::Elsewhere(Fail::new(
                 format!(
-                    "The iPhone refused the connection at {addr}, and no other port on it answers \
-                     as its pairing service. Turn on Developer Mode (Settings › Privacy & \
-                     Security › Developer Mode), and check Wi-Fi is on. If both are on, restart \
-                     the iPhone, connect LocalDevVPN again and run siboot again."
+                    "iPhone отклонил соединение по адресу {addr}; на других портах служба сопряжения не найдена. Включите режим разработчика (Настройки › Конфиденциальность и безопасность › Режим разработчика) и проверьте Wi-Fi. Если они включены, перезагрузите iPhone, подключите LocalDevVPN и снова запустите siboot."
                 ),
                 format!("{e} ({:?})", e.kind()),
             )))
@@ -283,10 +239,9 @@ async fn probe(addr: SocketAddr) -> std::result::Result<Found, Miss> {
         Err(_) => {
             return Err(Miss::Unreachable(Fail::new(
                 format!(
-                    "Nothing answered at {addr}. Connect LocalDevVPN (it shows Connected), and \
-                     check Wi-Fi is on."
+                    "По адресу {addr} нет ответа. Подключите LocalDevVPN (статус Connected) и проверьте Wi-Fi."
                 ),
-                "connect timed out after 8 s",
+                "истекло время ожидания подключения: 8 с",
             )))
         }
     };
@@ -294,39 +249,28 @@ async fn probe(addr: SocketAddr) -> std::result::Result<Found, Miss> {
         Ok(Ok(found)) => Ok(found),
         Ok(Err(e)) => Err(Miss::Elsewhere(Fail::new(
             format!(
-                "Something at {addr} took the connection but didn't answer as an iPhone, and no \
-                 other port there answers as its pairing service. Turn on Developer Mode \
-                 (Settings › Privacy & Security › Developer Mode) and check LocalDevVPN is the \
-                 VPN that's on."
+                "По адресу {addr} соединение принято, но устройство не ответило как iPhone; служба сопряжения на других портах не найдена. Включите режим разработчика (Настройки › Конфиденциальность и безопасность › Режим разработчика) и проверьте, что включён LocalDevVPN."
             ),
             chain(&e),
         ))),
         Err(_) => Err(Miss::Elsewhere(Fail::new(
             format!(
-                "The iPhone took the connection at {addr} but never answered, and no other port \
-                 there answers as its pairing service. Restart LocalDevVPN."
+                "Соединение с iPhone по адресу {addr} установлено, но ответа нет; служба сопряжения на других портах не найдена. Перезапустите LocalDevVPN."
             ),
-            "handshake timed out after 10 s",
+            "истекло время ожидания рукопожатия: 10 с",
         ))),
     }
 }
 
-/// The handshake the pairing service answers first.
 async fn handshake(stream: TcpStream) -> std::result::Result<Found, IdeviceError> {
     let mut client = RemotePairingClient::new(RpPairingSocket::new(stream), "siboot");
     let reply = client.attempt_pair_verify().await?;
     Ok(Found::from_handshake(&reply))
 }
 
-/// How to knock: kept apart so tests can wait less.
 struct Knocks {
-    /// Connections open at once. Minis's shell shares the app's file
-    /// descriptors, so not many.
     width: usize,
-    /// Through LocalDevVPN a closed port refuses and an open one accepts at
-    /// once; this also covers one lost SYN, which iOS sends again after 1 s.
     connect: Duration,
-    /// The pairing service answers its handshake within milliseconds.
     answer: Duration,
 }
 
@@ -336,27 +280,16 @@ const KNOCKS: Knocks = Knocks {
     answer: Duration::from_secs(3),
 };
 
-/// This many connections in a row that neither refuse nor connect: the route
-/// has gone, and knocking on would take minutes.
 const SILENT_IN_A_ROW: usize = 64;
-/// More ports than an iPhone has open in its dynamic range took the
-/// connection, so something else answers for this address. The iPhone
-/// checked had two there besides the pairing service and lockdownd.
 const MOST_OPEN: usize = 48;
-/// Times the shell ran out of descriptors or buffers before siboot gives up.
 const MOST_BUSY: usize = 256;
 
 enum Search {
-    /// Where it is, what it said, and how many ports were knocked on.
     Found(SocketAddr, Found, usize),
-    /// No port answered as the pairing service. `open` took the connection.
     NotFound { open: Vec<u16> },
-    /// Knocking had to stop, for the reason the advice says.
     Stopped(Fail),
 }
 
-/// Knock on each of `ports` at `ip`, `width` at a time, in order, until one
-/// answers as the pairing service.
 async fn search(ip: IpAddr, ports: Vec<u16>, knocks: &Knocks) -> Search {
     let total = ports.len().max(1);
     let mut queue = VecDeque::from(ports);
@@ -368,9 +301,12 @@ async fn search(ip: IpAddr, ports: Vec<u16>, knocks: &Knocks) -> Search {
     loop {
         while running.len() < width {
             let Some(port) = queue.pop_front() else { break };
-            running.spawn(knock(SocketAddr::new(ip, port), knocks.connect, knocks.answer));
+            running.spawn(knock(
+                SocketAddr::new(ip, port),
+                knocks.connect,
+                knocks.answer,
+            ));
         }
-        // Leaving early drops the set, which aborts the knocks still out.
         let Some(joined) = running.join_next().await else {
             return Search::NotFound { open };
         };
@@ -388,13 +324,10 @@ async fn search(ip: IpAddr, ports: Vec<u16>, knocks: &Knocks) -> Search {
                 if open.len() > MOST_OPEN {
                     return Search::Stopped(Fail::new(
                         format!(
-                            "Too many ports at {ip} take the connection for them to be this \
-                             iPhone's: something other than LocalDevVPN answers there, like \
-                             another VPN or a proxy. Turn it off, connect LocalDevVPN and run \
-                             siboot again."
+                        "Слишком много портов по адресу {ip} принимают соединение. Вероятно, отвечает не этот iPhone, а другой VPN или прокси. Отключите его, подключите LocalDevVPN и снова запустите siboot."
                         ),
                         format!(
-                            "{} ports took the connection, none answered RPPairing: {}",
+                            "Портов приняли соединение: {}; ни один не ответил как RPPairing: {}",
                             open.len(),
                             listed(&open)
                         ),
@@ -405,12 +338,9 @@ async fn search(ip: IpAddr, ports: Vec<u16>, knocks: &Knocks) -> Search {
                 silent += 1;
                 if silent >= SILENT_IN_A_ROW {
                     return Search::Stopped(Fail::new(
-                        "LocalDevVPN stopped carrying the connections while siboot looked for \
-                         this iPhone's pairing service. Connect LocalDevVPN again (it shows \
-                         Connected) and run siboot again.",
+                        "LocalDevVPN перестал передавать соединения во время поиска службы сопряжения. Подключите LocalDevVPN снова (статус Connected) и повторно запустите siboot.",
                         format!(
-                            "{silent} connections in a row neither refused nor connected within \
-                             {} s, the last to port {port}",
+                            "Соединения подряд без ответа: {silent}; время ожидания: {} с; последний порт: {port}",
                             knocks.connect.as_secs_f32()
                         ),
                     ));
@@ -420,12 +350,10 @@ async fn search(ip: IpAddr, ports: Vec<u16>, knocks: &Knocks) -> Search {
                 busy += 1;
                 if busy > MOST_BUSY {
                     return Search::Stopped(Fail::new(
-                        "Open Minis couldn't open enough connections to look for this iPhone's \
-                         pairing service. Close Minis, open it again and run siboot again.",
+                        "Open Minis не удалось открыть нужное число соединений для поиска службы сопряжения. Закройте Minis, снова откройте приложение и запустите siboot.",
                         format!("{e} ({:?}), {busy} times", e.kind()),
                     ));
                 }
-                // Fewer at once, and this port again later.
                 width = (width / 2).max(4).min(knocks.width.max(1));
                 queue.push_back(port);
                 continue;
@@ -436,23 +364,17 @@ async fn search(ip: IpAddr, ports: Vec<u16>, knocks: &Knocks) -> Search {
         let percent = (settled * 100 / total) as u64;
         if shown != Some(percent) {
             shown = Some(percent);
-            ui::percent("ports checked", percent);
+            ui::percent("проверено портов", percent);
         }
     }
 }
 
 enum Knock {
-    /// The pairing service.
     Answered(Found),
-    /// Nothing listens there.
     Closed,
-    /// Something took the connection, but didn't answer as the service.
     Open,
-    /// Neither refused nor connected in time.
     Silent,
-    /// Out of descriptors, buffers or local ports for now.
     Busy(std::io::Error),
-    /// The route itself refused.
     Failed(std::io::Error),
 }
 
@@ -466,7 +388,6 @@ async fn knock(addr: SocketAddr, connect: Duration, answer: Duration) -> (u16, K
             | ErrorKind::HostUnreachable
             | ErrorKind::NetworkDown => Knock::Failed(e),
             _ if is_busy(&e) => Knock::Busy(e),
-            // Refused, reset, or anything else about this one port.
             _ => Knock::Closed,
         },
         Ok(Ok(stream)) => match timeout(answer, handshake(stream)).await {
@@ -477,7 +398,6 @@ async fn knock(addr: SocketAddr, connect: Duration, answer: Duration) -> (u16, K
     (addr.port(), outcome)
 }
 
-/// Worth trying again with fewer connections open.
 fn is_busy(e: &std::io::Error) -> bool {
     matches!(
         e.raw_os_error(),
@@ -487,13 +407,10 @@ fn is_busy(e: &std::io::Error) -> bool {
 
 fn unreachable(addr: SocketAddr, e: &std::io::Error) -> Fail {
     let advice = match e.raw_os_error() {
-        // EPERM: iOS refused the route itself, which is what happens with no VPN
-        // carrying it (or with the iPhone's own Wi-Fi address as the target).
         Some(1) => format!(
-            "iOS won't let Minis reach {addr}. Connect LocalDevVPN (it shows Connected) and use \
-             its address, 10.7.0.1."
+            "iOS не разрешает Minis подключиться к {addr}. Подключите LocalDevVPN (статус Connected) и используйте его адрес 10.7.0.1."
         ),
-        _ => format!("Couldn't reach {addr}. Connect LocalDevVPN, and check Wi-Fi is on."),
+        _ => format!("Не удалось подключиться к {addr}. Подключите LocalDevVPN и проверьте Wi-Fi."),
     };
     Fail::new(advice, format!("{e} ({:?})", e.kind()))
 }
@@ -518,7 +435,6 @@ mod tests {
 
         let stub = fake_iphone::minis_stub(&home);
         assert!(check_minis(&Bridge::in_dir(&stub)).await.is_ok());
-        // 1.16 without the type declared is still 1.16: step 2 says so.
         std::fs::write(home.join("minis-undeclared"), b"").unwrap();
         assert!(check_minis(&Bridge::in_dir(&stub)).await.is_ok());
     }
@@ -535,8 +451,6 @@ mod tests {
         (listener, port)
     }
 
-    /// The iPhone's pairing service: each connection's handshake answered as
-    /// the iPhone answers it.
     async fn pairing_service() -> u16 {
         let (listener, port) = listener().await;
         tokio::spawn(async move {
@@ -571,8 +485,6 @@ mod tests {
         port
     }
 
-    /// Takes the connection and says nothing, as the iPhone's other
-    /// listeners do.
     async fn silent_service() -> u16 {
         let (listener, port) = listener().await;
         tokio::spawn(async move {
@@ -584,7 +496,6 @@ mod tests {
         port
     }
 
-    /// Answers, but not as the pairing service.
     async fn other_service() -> u16 {
         let (listener, port) = listener().await;
         tokio::spawn(async move {
@@ -595,7 +506,6 @@ mod tests {
         port
     }
 
-    /// A port nothing listens on any more.
     async fn closed_port() -> u16 {
         listener().await.1
     }
@@ -607,8 +517,11 @@ mod tests {
     #[tokio::test]
     async fn a_refused_port_sends_siboot_looking_for_the_service() {
         let (first, closed) = (closed_port().await, closed_port().await);
-        let (silent, other, service) =
-            (silent_service().await, other_service().await, pairing_service().await);
+        let (silent, other, service) = (
+            silent_service().await,
+            other_service().await,
+            pairing_service().await,
+        );
         let mut ports = vec![closed; 200];
         ports.extend([silent, other, closed, service]);
 
@@ -628,25 +541,36 @@ mod tests {
     #[tokio::test]
     async fn the_service_where_it_should_be_is_taken_without_looking() {
         let service = pairing_service().await;
-        // Nothing to look through: the first answer is the one used.
-        let (at, found) = reach(local(service), std::iter::empty(), &QUICK).await.unwrap();
+        let (at, found) = reach(local(service), std::iter::empty(), &QUICK)
+            .await
+            .unwrap();
         assert_eq!((at, found.wire_version), (local(service), 26));
     }
 
     #[tokio::test]
     async fn nowhere_is_said_with_what_took_the_connection() {
         let first = closed_port().await;
-        let (silent, other, closed) =
-            (silent_service().await, other_service().await, closed_port().await);
-        let f = reach(local(first), [closed, other, silent], &QUICK).await.unwrap_err();
+        let (silent, other, closed) = (
+            silent_service().await,
+            other_service().await,
+            closed_port().await,
+        );
+        let f = reach(local(first), [closed, other, silent], &QUICK)
+            .await
+            .unwrap_err();
         assert!(f.advice.starts_with(&format!(
-            "The iPhone refused the connection at 127.0.0.1:{first}, and no other port"
+            "iPhone отклонил соединение по адресу 127.0.0.1:{first}, остальные порты недоступны"
         )));
         assert!(f.advice.contains("restart the iPhone"));
         assert!(f.raw.contains("Connection refused"), "{}", f.raw);
         let (low, high) = (other.min(silent), other.max(silent));
         assert!(f.raw.contains("3 knocked on"), "{}", f.raw);
-        assert!(f.raw.ends_with(&format!("took the connection: {low}, {high})")), "{}", f.raw);
+        assert!(
+            f.raw
+                .ends_with(&format!("took the connection: {low}, {high})")),
+            "{}",
+            f.raw
+        );
         assert!(!f.known && !f.by_user);
     }
 
@@ -657,7 +581,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(f.advice.contains("another VPN or a proxy"), "{}", f.advice);
-        assert!(f.raw.starts_with(&format!("{} ports took the connection", MOST_OPEN + 1)));
+        assert!(f
+            .raw
+            .starts_with(&format!("{} ports took the connection", MOST_OPEN + 1)));
     }
 
     #[test]
@@ -666,7 +592,6 @@ mod tests {
         assert_eq!(ports.len(), 65535 - 49152 + 1 - 2);
         assert_eq!((ports[0], *ports.last().unwrap()), (49153, 65535));
         assert!(!ports.contains(&LOCKDOWN_PORT) && !ports.contains(&49152));
-        // Another port given with --port: 49152 is looked at first.
         assert_eq!(others(50000, DYNAMIC_PORTS)[0], 49152);
         assert_eq!(listed(&[54666, 49999]), "49999, 54666");
         assert_eq!(listed(&[]), "none");

@@ -1,57 +1,31 @@
-//! The Apple Accounts siboot remembers (step 4). A later run offers them in a
-//! menu instead of asking for the email, and signs in with the token saved
-//! with one, without the password, for as long as Apple takes it (account.rs).
-//!
-//! Only the emails are kept, in `~/.siboot/apple-accounts`, one a line, the one
-//! used last first, readable by this user only. Never the password: Minis's
-//! shell has no keychain to keep it in, and the token apple_session.rs saves
-//! after a sign-in is what spares it.
-//!
-//! No isideload here, so `examples/screens.rs` shows the same questions.
-
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-/// The list, in siboot's folder.
 pub const FILE: &str = "apple-accounts";
 
-/// Kept at most, the oldest let go: with the menu's other two choices, a
-/// digit still picks any of them (ui.rs takes 1–9).
 pub const MAX: usize = 7;
 
-/// The question when there's an Apple Account to offer.
-pub const QUESTION: &str = "sign in with which Apple Account?";
-/// The menu's choice for one it doesn't list.
-pub const ANOTHER: &str = "Another Apple Account";
-/// And for taking one off it.
-pub const FORGET: &str = "Forget an Apple Account";
-/// Which one to forget, when there's more than one.
-pub const FORGET_WHICH: &str = "forget which Apple Account?";
+pub const QUESTION: &str = "с какой учётной записью Apple войти?";
+pub const ANOTHER: &str = "Другая учётная запись Apple";
+pub const FORGET: &str = "Удалить учётную запись Apple";
+pub const FORGET_WHICH: &str = "какую учётную запись Apple удалить?";
 
-/// Said the first time an Apple Account signs in.
-pub const SAVED: &str = "siboot will offer this Apple Account next time, and skip the password \
-                         while Apple's sign-in lasts. It saves the email, never the password.";
-/// Said when there was a saved sign-in, but Apple wants the password again.
-pub const RUN_OUT: &str = "The saved sign-in has run out, so Apple needs the password again.";
+pub const SAVED: &str = "В следующий раз siboot предложит эту учётную запись и не запросит пароль, пока действует вход Apple. Сохраняется адрес почты, но не пароль.";
+pub const RUN_OUT: &str = "Сохранённый вход истёк — Apple снова требует пароль.";
 
 pub fn path(home: &Path) -> PathBuf {
     home.join(FILE)
 }
 
-/// Whether siboot has kept a list here yet, even an empty one: from 0.20.0.
 pub fn exists(home: &Path) -> bool {
     path(home).is_file()
 }
 
-/// The saved Apple Accounts, the one used last first. Nothing saved, or a
-/// file that can't be read: none.
 pub fn list(home: &Path) -> Vec<String> {
     let text = std::fs::read_to_string(path(home)).unwrap_or_default();
     tidy(text.lines())
 }
 
-/// As account.rs signs in with them: trimmed and lowercase, once each, and no
-/// more than `MAX`. A line that can't be an email is left out.
 fn tidy<'a>(emails: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for email in emails {
@@ -65,7 +39,6 @@ fn tidy<'a>(emails: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     out
 }
 
-/// `email` first, as the one used last. True when it wasn't saved before.
 pub fn remember(home: &Path, email: &str) -> io::Result<bool> {
     let email = email.trim().to_lowercase();
     let before = list(home);
@@ -76,7 +49,6 @@ pub fn remember(home: &Path, email: &str) -> io::Result<bool> {
     Ok(new)
 }
 
-/// `email` off the list. True when it was on it.
 pub fn forget(home: &Path, email: &str) -> io::Result<bool> {
     let email = email.trim().to_lowercase();
     let mut accounts = list(home);
@@ -89,14 +61,10 @@ pub fn forget(home: &Path, email: &str) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Starts the list with `emails`, the one used last first: those that signed
-/// in here before siboot kept one. Written even when there are none, so
-/// it's done once.
 pub fn start(home: &Path, emails: &[String]) -> io::Result<()> {
     write(home, &tidy(emails.iter().map(String::as_str)))
 }
 
-/// Written whole, then renamed into place, readable by this user only.
 fn write(home: &Path, accounts: &[String]) -> io::Result<()> {
     std::fs::create_dir_all(home)?;
     let path = path(home);
@@ -112,7 +80,6 @@ fn write(home: &Path, accounts: &[String]) -> io::Result<()> {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         options.mode(0o600);
         let mut file = options.open(&tmp)?;
-        // One left from before keeps its mode: set it again.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(text.as_bytes())?;
     }
@@ -121,7 +88,6 @@ fn write(home: &Path, accounts: &[String]) -> io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
-/// The menu: each saved Apple Account, then another, then forgetting one.
 pub fn options(saved: &[String]) -> Vec<String> {
     let mut options = saved.to_vec();
     options.push(ANOTHER.to_string());
@@ -129,7 +95,6 @@ pub fn options(saved: &[String]) -> Vec<String> {
     options
 }
 
-/// What the menu's `index` picked, with `saved` accounts listed first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
     Account(usize),
@@ -168,7 +133,6 @@ mod tests {
         assert!(remember(&home, "first@example.com").unwrap());
         assert!(remember(&home, "second@example.com").unwrap());
         assert_eq!(list(&home), ["second@example.com", "first@example.com"]);
-        // Again, typed another way: moved up, not added.
         assert!(!remember(&home, "  First@Example.com ").unwrap());
         assert_eq!(list(&home), ["first@example.com", "second@example.com"]);
         assert_eq!(
@@ -201,7 +165,6 @@ mod tests {
         assert!(!forget(&home, "a@example.com").unwrap());
         assert!(forget(&home, "b@example.com").unwrap());
         assert!(list(&home).is_empty());
-        // Still there, empty: siboot has kept a list, so it isn't started again.
         assert!(exists(&home));
         std::fs::remove_dir_all(&home).unwrap();
     }
@@ -236,7 +199,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let home = home("mode");
         std::fs::create_dir_all(&home).unwrap();
-        // Left from before, readable by everyone.
         std::fs::write(path(&home).with_extension("tmp"), "").unwrap();
         std::fs::set_permissions(
             path(&home).with_extension("tmp"),

@@ -1,13 +1,3 @@
-//! A fake iPhone for tests: the device's side of iOS 27's device-initiated
-//! pair-setup, as Settings › Developer Mode › "Pair with …" drives it.
-//!
-//! In that conversation the device is the rppairing "host" and SRP *client*: it
-//! sends the handshake, M1, M3 (with the PIN the user typed) and M5 (its own
-//! identity), and checks the accessory's proof (M4) and identity (M6). This is
-//! the mirror of idevice's `PairableHost`, written from the same constants, so a
-//! test can pair all the way to a pairing file with no iPhone. It also writes
-//! stand-ins for Minis's commands (`minis_stub`).
-
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -28,7 +18,6 @@ pub const MODEL: &str = "iPhone17,3";
 pub const UDID: &str = "00008140-0001FAKE0000801C";
 pub const ALT_IRK: [u8; 16] = *b"fake-iphone-irk!";
 
-// TLV8 types (idevice's `PairingDataComponentType`).
 const METHOD: u8 = 0x00;
 const IDENTIFIER: u8 = 0x01;
 const SALT: u8 = 0x02;
@@ -40,7 +29,6 @@ const ERROR: u8 = 0x07;
 const SIGNATURE: u8 = 0x0a;
 const INFO: u8 = 0x11;
 
-/// What the host told the device about itself in M6.
 pub struct Outcome {
     pub host_identifier: String,
     pub host_public_key: Vec<u8>,
@@ -48,7 +36,6 @@ pub struct Outcome {
 
 type Tlv = Vec<(u8, Vec<u8>)>;
 
-/// Pair with the pairable host listening at `addr`, typing `pin` when asked.
 pub async fn pair(addr: SocketAddr, pin: impl Future<Output = String>) -> Result<Outcome, String> {
     let stream = TcpStream::connect(addr)
         .await
@@ -56,7 +43,6 @@ pub async fn pair(addr: SocketAddr, pin: impl Future<Output = String>) -> Result
     let mut socket = RpPairingSocket::new(stream);
     let mut seq = 0usize;
 
-    // Handshake: a device-initiated pairing asks for pair-setup, not verify.
     send(
         &mut socket,
         &mut seq,
@@ -76,7 +62,6 @@ pub async fn pair(addr: SocketAddr, pin: impl Future<Output = String>) -> Result
         return Err(format!("the host doesn't allow pair-setup: {reply}"));
     }
 
-    // M1
     send_tlv(
         &mut socket,
         &mut seq,
@@ -85,14 +70,12 @@ pub async fn pair(addr: SocketAddr, pin: impl Future<Output = String>) -> Result
     )
     .await?;
 
-    // M2: salt and B; the host shows the PIN as it sends them.
     let m2 = recv_tlv(&mut socket).await?;
     expect_state(&m2, 2)?;
     let salt = get(&m2, SALT);
     let b_pub = get(&m2, PUBLIC_KEY);
     let pin = pin.await;
 
-    // M3: A and the client proof.
     let srp = SrpClient::<Sha512>::new(&G_3072);
     let a_private = [0x5au8; 32];
     let a_pub = srp.compute_public_ephemeral(&a_private);
@@ -118,7 +101,6 @@ pub async fn pair(addr: SocketAddr, pin: impl Future<Output = String>) -> Result
     )
     .await?;
 
-    // M4: the server proof, or a refusal of the code.
     let m4 = recv_tlv(&mut socket).await?;
     if !get(&m4, ERROR).is_empty() {
         return Err("the host refused the code".into());
@@ -134,7 +116,6 @@ pub async fn pair(addr: SocketAddr, pin: impl Future<Output = String>) -> Result
         b"Pair-Setup-Encrypt-Info",
     )));
 
-    // M5: this device's identity.
     let device_key = SigningKey::from_bytes(&[7u8; 32]);
     let device_ltpk = device_key.verifying_key().to_bytes();
     let mut signed = hkdf32(
@@ -176,7 +157,6 @@ pub async fn pair(addr: SocketAddr, pin: impl Future<Output = String>) -> Result
     )
     .await?;
 
-    // M6: the host's identity, checked as a device checks it.
     let m6 = recv_tlv(&mut socket).await?;
     expect_state(&m6, 6)?;
     let opened = cipher
@@ -279,7 +259,6 @@ fn hkdf32(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
     out
 }
 
-/// TLV8: type, length, value; values over 255 bytes go in consecutive entries.
 fn tlv_encode(entries: &[(u8, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (kind, data) in entries {
@@ -307,7 +286,6 @@ fn tlv_decode(bytes: &[u8]) -> Result<Tlv, String> {
     Ok(out)
 }
 
-/// Every entry of `kind`, joined, as fragments of one value are.
 fn get(tlv: &Tlv, kind: u8) -> Vec<u8> {
     tlv.iter()
         .filter(|(k, _)| *k == kind)
@@ -320,7 +298,6 @@ enum Opack<'a> {
     Data(&'a [u8]),
 }
 
-/// An OPACK dictionary of strings and data, as idevice's encoder writes one.
 fn opack_dict(entries: &[(&str, Opack)]) -> Vec<u8> {
     fn sized(out: &mut Vec<u8>, inline: u8, long: u8, bytes: &[u8]) {
         if bytes.len() <= 0x20 {
@@ -342,17 +319,6 @@ fn opack_dict(entries: &[(&str, Opack)]) -> Vec<u8> {
     out
 }
 
-/// Stand-ins for Minis's commands, in `<home>/stub-bin`. Each logs its
-/// arguments to `<home>/minis-calls.log` and answers with the envelope
-/// bonjour.md describes. `advertise` reports the guest port as Minis's own:
-/// there is no app in between to forward. `list` reports Minis in the
-/// background while `<home>/minis-background` exists, and an advertisement
-/// left from an earlier run while `<home>/minis-leftover` does. With
-/// `<home>/minis-deny-once`, the next `advertise` is refused as iOS refuses
-/// it before Local Network access is allowed (and the file goes); with
-/// `<home>/minis-undeclared`, this Minis doesn't declare the pairing type;
-/// with `<home>/minis-player-closed`, the player's sheet was closed, until
-/// the next `play`.
 pub fn minis_stub(home: &Path) -> PathBuf {
     let dir = home.join("stub-bin");
     std::fs::create_dir_all(&dir).unwrap();
@@ -434,11 +400,6 @@ esac"#,
 mod tests {
     use super::*;
 
-    /// Pairs with a siboot running elsewhere (under the iSH emulator, say)
-    /// whose Minis commands are `minis_stub`'s, logging to `$SIBOOT_FAKE_LOG`.
-    /// The port comes from its `minis-bonjour advertise` call and the code from
-    /// the notification it posts, as a person would read it:
-    /// `SIBOOT_FAKE_LOG=… cargo test dial_a_running_siboot -- --ignored`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs a siboot waiting to pair"]
     async fn dial_a_running_siboot() {
@@ -446,8 +407,11 @@ mod tests {
         let advertised = wait_for_line(&log, "minis-bonjour advertise").await;
         let port: u16 = advertised.split(' ').nth(4).unwrap().parse().unwrap();
         let pin = async {
-            let posted =
-                wait_for_line(&log, "apple-notification schedule --title siboot pairing code").await;
+            let posted = wait_for_line(
+                &log,
+                "apple-notification schedule --title siboot pairing code",
+            )
+            .await;
             let body = posted.split("--body ").nth(1).unwrap();
             body.chars()
                 .filter(char::is_ascii_digit)
@@ -457,7 +421,7 @@ mod tests {
         let outcome = pair(SocketAddr::from(([127, 0, 0, 1], port)), pin)
             .await
             .expect("paired");
-        println!("paired with host {}", outcome.host_identifier);
+        println!("сопряжение с узлом {} выполнено", outcome.host_identifier);
     }
 
     async fn wait_for_line(log: &Path, prefix: &str) -> String {

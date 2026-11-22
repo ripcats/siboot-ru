@@ -1,30 +1,3 @@
-//! The terminal UI: a live screen on a terminal, plain lines everywhere else.
-//!
-//! On Minis's terminal, siboot keeps a small live area at the bottom of what
-//! it has printed: the running step with a spinner and what it's doing, a
-//! progress bar, the steps still to come, and prompts that read keys (y/n,
-//! menus, code boxes, a masked password). A finished step, a warning or an
-//! answer is printed above that area and stays, so the scrollback reads as a
-//! log of the run.
-//!
-//! The live area ends in the credit, dim, from the header on: it's under every
-//! step and prompt, and still the last line when siboot exits. It's the first
-//! thing to go on a screen too short for it.
-//!
-//! The live area is redrawn in place, so it never wraps and never outgrows
-//! the screen: each of its lines is cut to the terminal's width, and the area
-//! to its height. Each step still says what it's doing before the work
-//! starts, so a stall is attributable to a named step, and errors name the
-//! thing the user can change while the raw cause goes to the verbose channel.
-//!
-//! Without a terminal on both ends, with `--plain` or `--verbose`, with
-//! TERM=dumb or SIBOOT_PLAIN set, and in the tests, the output is plain lines,
-//! one per event.
-//!
-//! In Open Minis (and with `--web`), every event also goes to a page in
-//! Minis's browser (`web.rs`), and the questions are asked there instead: fields, code boxes
-//! and buttons. The terminal under it keeps the plain lines.
-
 use std::fmt::Write as _;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -34,8 +7,6 @@ use serde_json::json;
 
 use crate::web;
 
-// SGR styles, in ANSI's own colors so the terminal's theme picks the shades
-// for a light or a dark background.
 const ACCENT: &str = "36";
 const STRONG: &str = "1;36";
 const GOOD: &str = "1;32";
@@ -47,28 +18,17 @@ const BADGE: &str = "1;30;46";
 const NONE: &str = "";
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// How often the spinner moves and the live area is redrawn.
 const TICK: Duration = Duration::from_millis(80);
-/// The step names' column, after "  ✓ ".
 const NAME_WIDTH: usize = 10;
-/// Where a step's text, and an answer in a prompt, start.
 const TEXT_COLUMN: usize = 4 + NAME_WIDTH;
-/// A box is no wider than this, however wide the terminal is.
 const BOX_MAX: usize = 60;
-/// Plain output's indent under a `[n/total]` line.
 const INDENT: &str = "      ";
-/// Under the live area for as long as it's there, and after the version in
-/// plain output.
-const CREDIT: &str = "A project by Frizzle";
+const CREDIT: &str = "Проект ripcats";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
-    /// One line per event, as a log.
     Plain,
-    /// The live screen.
     Live,
-    /// The live screen is over (done, stopped, or given up on): what's left
-    /// prints as plain lines.
     Closed,
 }
 
@@ -76,46 +36,33 @@ struct Ui {
     mode: Mode,
     color: bool,
     verbose: bool,
-    /// Plain output numbers steps `[n/total]`.
     total: usize,
-    /// The steps this run goes through.
     plan: Vec<&'static str>,
-    /// Index into `plan` of the running step.
     active: Option<usize>,
-    /// What the running step is doing now.
     status: String,
     step_started: Instant,
     run_started: Instant,
     bar: Option<Bar>,
     dialog: Option<Dialog>,
-    /// What the user gave in this step so far, shown above its next prompt.
     answers: Vec<(String, String)>,
-    /// The live area's rows, and which of them the cursor is on.
     rows: usize,
     cursor_row: usize,
-    /// The last line printed above the live area is blank, so the credit,
-    /// alone in the area, needs no blank line of its own.
     after_blank: bool,
     frame: usize,
-    /// Plain output: the progress line being rewritten with `\r`, if any, and
-    /// the last percentage printed for `plain_label`.
     plain_open: bool,
     plain_label: String,
     plain_percent: Option<u64>,
-    /// The stop box is on screen (the run failed): Ctrl-C at the question
-    /// after it only leaves.
     stopped: bool,
+    paused: bool,
 }
 
 struct Bar {
     done: u64,
     total: u64,
-    /// Bytes, shown as MB with the time left; else a percentage alone.
     bytes: bool,
     started: Instant,
 }
 
-/// A prompt's lines under the running step, and where its cursor goes.
 struct Dialog {
     lines: Vec<Line>,
     cursor: Option<(usize, usize)>,
@@ -133,16 +80,9 @@ fn flush() {
     let _ = io::stdout().flush();
 }
 
-// ---------------------------------------------------------------- the log
-
-/// Everything the run showed, as plain lines stamped with the time since it
-/// started, and the libraries' own log lines: the log siboot offers to copy
-/// when it stops (`report.rs`).
 struct Record {
     lines: Vec<String>,
-    /// The last line kept, so a status shown again isn't.
     last: String,
-    /// Lines let go from the middle, past `RECORD_MAX`.
     dropped: usize,
 }
 
@@ -152,16 +92,15 @@ static RECORD: Mutex<Record> = Mutex::new(Record {
     dropped: 0,
 });
 static STARTED: OnceLock<Instant> = OnceLock::new();
-/// Lines kept: past it, the oldest after `RECORD_HEAD` go, so the log keeps
-/// how the run started and how it ended.
 const RECORD_MAX: usize = 4000;
 const RECORD_HEAD: usize = 200;
 
 fn record_lock() -> MutexGuard<'static, Record> {
-    RECORD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    RECORD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Keep `text` in the run's log, one entry per line of it.
 pub fn record(text: &str) {
     let secs = STARTED.get_or_init(Instant::now).elapsed().as_secs();
     let stamp = format!("{:02}:{:02}", secs / 60, secs % 60);
@@ -180,18 +119,16 @@ pub fn record(text: &str) {
     }
 }
 
-/// The run's log so far.
 pub fn recorded() -> Vec<String> {
     let r = record_lock();
     let mut lines = r.lines.clone();
     if r.dropped > 0 {
         let at = RECORD_HEAD.min(lines.len());
-        lines.insert(at, format!("      … {} lines left out …", r.dropped));
+        lines.insert(at, format!("      … пропущено строк: {} …", r.dropped));
     }
     lines
 }
 
-/// tracing's output into the run's log, whatever the screen shows of it.
 pub struct RecordLines;
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RecordLines {
@@ -224,7 +161,6 @@ impl Drop for RecordLine {
     }
 }
 
-/// Chooses the live screen or plain lines. Called once, before any output.
 pub fn init(verbose: bool, plain: bool) {
     STARTED.get_or_init(Instant::now);
     let tty = io::stdout().is_terminal();
@@ -249,14 +185,10 @@ pub fn is_live() -> bool {
     ui().mode == Mode::Live
 }
 
-/// Whether questions can be more than a typed line: keys one at a time on the
-/// live screen, or the page's fields and buttons. Code boxes and menus need
-/// one or the other.
 pub fn interactive() -> bool {
     is_live() || web::page().is_some()
 }
 
-/// Moves the spinner, the timer and the progress bar.
 fn tick() {
     loop {
         std::thread::sleep(TICK);
@@ -272,11 +204,9 @@ fn tick() {
     }
 }
 
-/// The name, version and what this run does, with the one thing to keep in
-/// mind while it runs.
 pub fn header(version: &str, tagline: &str) {
     record(&format!("siboot {version} — {tagline}"));
-    let note = "Keep Minis open until siboot is done: iOS pauses it in the background.";
+    let note = "Не закрывайте Minis до завершения siboot: iOS приостанавливает его в фоне.";
     web::send(json!({"t": "header", "version": version, "tagline": tagline, "note": note}));
     let mut ui = ui();
     if ui.mode != Mode::Live {
@@ -320,8 +250,6 @@ pub fn header(version: &str, tagline: &str) {
     ui.paint(&above);
 }
 
-/// The steps this run goes through, by name; plain output counts them out of
-/// `total`.
 pub fn plan(names: &[&'static str], total: usize) {
     web::send(json!({"t": "plan", "steps": names}));
     let mut ui = ui();
@@ -329,7 +257,6 @@ pub fn plan(names: &[&'static str], total: usize) {
     ui.total = total;
 }
 
-/// Step `n` (from 1) starts: `title` says what it does.
 pub fn step(n: usize, title: &str) {
     web::send(json!({"t": "step", "n": n, "title": title}));
     let mut ui = ui();
@@ -344,7 +271,6 @@ pub fn step(n: usize, title: &str) {
         flush();
         return;
     }
-    // A step still running when the next starts has finished.
     let status = ui.status.clone();
     let above = ui.settle("✓", GOOD, &status);
     ui.active = Some(n.saturating_sub(1));
@@ -353,7 +279,25 @@ pub fn step(n: usize, title: &str) {
     ui.paint(&above);
 }
 
-/// The running step is done: `summary` stays on its line.
+pub fn pause_stage() {
+    web::send(json!({"t": "pause"}));
+    let mut ui = ui();
+    ui.paused = true;
+    if ui.mode == Mode::Live {
+        ui.paint(&[]);
+    }
+}
+
+pub fn resume_stage() {
+    web::send(json!({"t": "resume"}));
+    let mut ui = ui();
+    ui.paused = false;
+    ui.step_started = Instant::now();
+    if ui.mode == Mode::Live {
+        ui.paint(&[]);
+    }
+}
+
 pub fn done(summary: &str) {
     record(&format!("    ✓ {summary}"));
     web::send(json!({"t": "done", "summary": summary}));
@@ -364,7 +308,6 @@ pub fn done(summary: &str) {
     }
 }
 
-/// What the running step is doing now. Plain output prints it.
 pub fn status(msg: &str) {
     record(&format!("      {msg}"));
     web::send(json!({"t": "status", "text": msg}));
@@ -382,9 +325,6 @@ pub fn status(msg: &str) {
     }
 }
 
-/// Like `status`, but plain output prints it only with `--verbose`: the live
-/// screen shows each small step, a log only the ones that matter. The page
-/// shows each one, as the live screen does.
 pub fn activity(msg: &str) {
     if is_live() {
         status(msg);
@@ -394,7 +334,6 @@ pub fn activity(msg: &str) {
     }
 }
 
-/// Something that worked.
 pub fn ok(msg: &str) {
     record(&format!("   OK {msg}"));
     web::send(json!({"t": "ok", "text": msg}));
@@ -422,7 +361,6 @@ pub fn ok(msg: &str) {
     }
 }
 
-/// Information that stays on screen.
 pub fn note(msg: &str) {
     record(&format!("      {msg}"));
     web::send(json!({"t": "note", "text": msg}));
@@ -455,14 +393,11 @@ pub fn warn(msg: &str) {
     }
 }
 
-/// Useful only when diagnosing. Shown with `--verbose`, which is plain, and
-/// on the page under Show details.
 pub fn detail(msg: &str) {
     web::send(json!({"t": "detail", "text": msg}));
     detail_here(msg);
 }
 
-/// `detail` on this terminal and in the log, not on the page.
 fn detail_here(msg: &str) {
     record(&format!("   ·· {msg}"));
     let mut ui = ui();
@@ -472,7 +407,6 @@ fn detail_here(msg: &str) {
     }
 }
 
-/// A library's log line (tracing), printed above the live area.
 pub fn log(line: &str) {
     let mut ui = ui();
     if ui.mode == Mode::Live {
@@ -483,12 +417,10 @@ pub fn log(line: &str) {
     }
 }
 
-/// Progress in bytes, under the running step.
 pub fn progress(label: &str, done: u64, total: u64) {
     show_bar(label, done, total, true);
 }
 
-/// Progress as a percentage, under the running step.
 pub fn percent(label: &str, percent: u64) {
     show_bar(label, percent.min(100), 100, false);
 }
@@ -505,7 +437,6 @@ fn show_bar(label: &str, done: u64, total: u64, bytes: bool) {
         return;
     }
     match ui.bar.as_mut() {
-        // The ticker redraws it.
         Some(bar) if bar.bytes == bytes => {
             bar.done = done;
             bar.total = total;
@@ -522,7 +453,6 @@ fn show_bar(label: &str, done: u64, total: u64, bytes: bool) {
     }
 }
 
-/// The progress bar is done with.
 pub fn progress_end() {
     web::progress_end();
     let mut ui = ui();
@@ -535,9 +465,8 @@ pub fn progress_end() {
     }
 }
 
-/// The run worked: `title` and `paragraphs`, in a box.
 pub fn finish(title: &str, paragraphs: &[&str]) {
-    record(&format!("Done: {title}"));
+    record(&format!("Готово: {title}"));
     let mut ui = ui();
     let took = clock(ui.run_started.elapsed().as_secs());
     web::send(json!({"t": "finish", "title": title, "paragraphs": paragraphs, "took": took}));
@@ -577,11 +506,8 @@ pub fn finish(title: &str, paragraphs: &[&str]) {
     ui.close();
 }
 
-/// Report a failure: the advice always, the raw cause with `--verbose` (and
-/// in the log). The live screen stays open for one more question: `close`
-/// ends it.
 pub fn failure(advice: &str, raw: &str) {
-    record(&format!("Stopped: {advice}"));
+    record(&format!("Остановлено: {advice}"));
     if !raw.is_empty() {
         record(&format!("   cause: {raw}"));
     }
@@ -589,18 +515,20 @@ pub fn failure(advice: &str, raw: &str) {
     let took = clock(ui.run_started.elapsed().as_secs());
     web::send(json!({"t": "failure", "advice": advice, "cause": raw, "took": took}));
     if ui.mode != Mode::Live {
-        // Stopping at the question after this says nothing more (`stop_now`).
         ui.stopped = true;
         ui.end_plain_line();
         flush();
         eprintln!();
-        eprintln!("{} {advice}", ui.style(BAD, "Stopped:"));
+        eprintln!("{} {advice}", ui.style(BAD, "Остановлено:"));
         if ui.verbose {
-            eprintln!("{INDENT}{} {raw}", ui.style(DIM, "cause:"));
+            eprintln!("{INDENT}{} {raw}", ui.style(DIM, "причина:"));
         } else if !raw.is_empty() {
             eprintln!(
                 "{INDENT}{}",
-                ui.style(DIM, "run again with --verbose to see the underlying error")
+                ui.style(
+                    DIM,
+                    "запустите с --verbose, чтобы увидеть подробности ошибки"
+                )
             );
         }
         let _ = io::stderr().flush();
@@ -611,25 +539,15 @@ pub fn failure(advice: &str, raw: &str) {
     ui.stopped = true;
 }
 
-/// A button on the page, in the box the run ends in (`finish` or `failure`):
-/// the app it installed, or the App Store for an update. Nothing on the
-/// terminal.
 pub fn link(label: &str, url: &str) {
     web::send(json!({"t": "link", "label": label, "url": url}));
 }
 
-/// Leave the terminal as it was, and tell the page the run is over. Safe to
-/// call more than once.
 pub fn close() {
     ui().close();
     web::close();
 }
 
-// ---------------------------------------------------------------- prompts
-
-/// A line of text, in a field labelled `label` showing `placeholder` while
-/// it's empty, while the running step shows `question`. `plain` is the prompt
-/// in plain output. None when the user stops (Esc, or the end of input).
 pub fn ask_text(question: &str, label: &str, placeholder: &str, plain: &str) -> Option<String> {
     if let Some(page) = web::page() {
         let answer = page.text(question, label, placeholder, false);
@@ -652,13 +570,14 @@ pub fn ask_text(question: &str, label: &str, placeholder: &str, plain: &str) -> 
     answer
 }
 
-/// A prompt in the log: what it asked and, never what was typed, only
-/// whether something was.
 fn record_answer(question: &str, said: Option<&str>) {
-    record(&format!("   ?  {} › {}", capitalized(question), said.unwrap_or("(stopped)")));
+    record(&format!(
+        "   ?  {} › {}",
+        capitalized(question),
+        said.unwrap_or("(остановлено)")
+    ));
 }
 
-/// Like `ask_text`, shown as dots.
 pub fn ask_secret(
     question: &str,
     label: &str,
@@ -686,8 +605,6 @@ pub fn ask_secret(
     answer
 }
 
-/// A six-digit code, in boxes that fill as it's typed (the sixth digit sends
-/// it), while the running step shows `question`; `hint` goes under the boxes.
 pub fn ask_code(question: &str, label: &str, hint: &str, plain: &str) -> Option<String> {
     let answer = if let Some(page) = web::page() {
         match page.code(question, label, &[(false, hint)], false) {
@@ -710,7 +627,6 @@ pub fn ask_code(question: &str, label: &str, hint: &str, plain: &str) -> Option<
     answer
 }
 
-/// A line under the code boxes.
 #[derive(Clone)]
 pub enum Hint {
     Plain(String),
@@ -719,16 +635,10 @@ pub enum Hint {
 
 pub enum CodeAnswer {
     Code(String),
-    /// A letter was typed, or Other ways tapped: the user wants another way
-    /// to get the code.
     More,
     Cancel,
 }
 
-/// The live screen or the page only (`interactive`): a six-digit code, while
-/// the running step shows `question`; a letter, or the page's Other ways,
-/// asks for `More`. None on plain output, or when keys can't be read one at a
-/// time after all (the screen is plain from then on): then ask the plain way.
 pub fn ask_code_or_more(question: &str, label: &str, hints: &[Hint]) -> Option<CodeAnswer> {
     let answer = if let Some(page) = web::page() {
         let hints: Vec<(bool, &str)> = hints
@@ -744,9 +654,8 @@ pub fn ask_code_or_more(question: &str, label: &str, hints: &[Hint]) -> Option<C
             web::Code::Cancel => CodeAnswer::Cancel,
         })
     } else if is_live() {
-        // The keys that answer, under the hints given.
         let mut shown = hints.to_vec();
-        shown.push(Hint::Plain("o: other ways · esc: cancel".into()));
+        shown.push(Hint::Plain("o: другие способы · Esc: отмена".into()));
         let saved = swap_status(question);
         let answer = match code(label, &shown, true) {
             Asked::Answer(answer) => Some(answer),
@@ -759,31 +668,28 @@ pub fn ask_code_or_more(question: &str, label: &str, hints: &[Hint]) -> Option<C
     };
     match &answer {
         Some(CodeAnswer::Code(_)) => record_answer(question, Some("(a code)")),
-        Some(CodeAnswer::More) => record_answer(question, Some("other ways")),
+        Some(CodeAnswer::More) => record_answer(question, Some("другие способы")),
         Some(CodeAnswer::Cancel) => record_answer(question, None),
         None => {}
     }
     answer
 }
 
-/// A yes or no: `y` and `n` answer at once, the arrows move, return takes
-/// the highlighted one, which starts as `default`. With no step running (the
-/// run has stopped), the question goes above the choice.
 pub fn confirm(question: &str, default: bool) -> bool {
     let answer = match web::page() {
         Some(page) => page.confirm(question, default),
         None => confirm_prompt(question, default),
     };
-    record_answer(question, Some(if answer { "Yes" } else { "No" }));
+    record_answer(question, Some(if answer { "Да" } else { "Нет" }));
     answer
 }
 
 fn confirm_prompt(question: &str, default: bool) -> bool {
     if !is_live() {
-        let hint = if default { "[Y/n]" } else { "[y/N]" };
+        let hint = if default { "[Д/н]" } else { "[д/Н]" };
         return match ask(&format!("{} {hint} ", capitalized(question))) {
             Some(answer) if answer.is_empty() => default,
-            Some(answer) => matches!(answer.to_lowercase().as_str(), "y" | "yes"),
+            Some(answer) => matches!(answer.to_lowercase().as_str(), "y" | "yes" | "д" | "да"),
             None => false,
         };
     }
@@ -809,14 +715,14 @@ fn confirm_prompt(question: &str, default: bool) -> bool {
                 );
                 Line::new().add(NONE, "    ")
             };
-            line = choice(line, "Yes", yes).add(NONE, "   ");
-            line = choice(line, "No", !yes).add(DIM, "   y/n");
+            line = choice(line, "Да", yes).add(NONE, "   ");
+            line = choice(line, "Нет", !yes).add(DIM, "   д/н");
             lines.push(line);
             ui.show_dialog(lines, None);
         }
         match keys.next() {
-            Key::Char('y' | 'Y') => break true,
-            Key::Char('n' | 'N') => break false,
+            Key::Char('y' | 'Y' | 'д' | 'Д') => break true,
+            Key::Char('n' | 'N' | 'н' | 'Н') => break false,
             Key::Left | Key::Right | Key::Up | Key::Down | Key::Tab | Key::Char('h' | 'l') => {
                 yes = !yes
             }
@@ -834,7 +740,7 @@ fn confirm_prompt(question: &str, default: bool) -> bool {
         &format!(
             "{} › {}",
             capitalized(question),
-            if answer { "Yes" } else { "No" }
+            if answer { "Да" } else { "Нет" }
         ),
     );
     ui.dialog = None;
@@ -842,11 +748,6 @@ fn confirm_prompt(question: &str, default: bool) -> bool {
     answer
 }
 
-/// Before the user leaves Minis to do something elsewhere (pair in Settings):
-/// `title`, what to do there in `steps`, what to know first in `notes`, and
-/// `button` to start. True to go ahead, false to stop (Cancel, Esc, No). The
-/// page shows it all on one card; the live screen prints it and asks yes or
-/// no; plain output prints it and goes ahead, as there's nothing to wait for.
 pub fn get_ready(title: &str, steps: &[&str], notes: &[&str], button: &str) -> bool {
     record(&format!("      {title}:"));
     for (n, step) in steps.iter().enumerate() {
@@ -865,7 +766,25 @@ pub fn get_ready(title: &str, steps: &[&str], notes: &[&str], button: &str) -> b
             true
         }
     };
-    record_answer(title, Some(if go { button } else { "Cancel" }));
+    record_answer(title, Some(if go { button } else { "Отмена" }));
+    go
+}
+
+pub fn get_ready_and_confirm(title: &str, steps: &[&str], notes: &[&str], button: &str) -> bool {
+    record(&format!("      {title}:"));
+    for (n, step) in steps.iter().enumerate() {
+        record(&format!("        {}. {step}", n + 1));
+    }
+    for note in notes {
+        record(&format!("        {note}"));
+    }
+    let go = if let Some(page) = web::page() {
+        page.ready(title, steps, notes, button)
+    } else {
+        print_ready(title, steps, notes);
+        confirm_prompt(&format!("{}?", lowercase_first(button)), true)
+    };
+    record_answer(title, Some(if go { button } else { "Отмена" }));
     go
 }
 
@@ -893,28 +812,32 @@ fn print_ready(title: &str, steps: &[&str], notes: &[&str]) {
             .render(max, ui.color),
     ];
     for (n, step) in steps.iter().enumerate() {
-        let lead = Line::new().add(NONE, "    ").add(STRONG, format!("{}. ", n + 1));
+        let lead = Line::new()
+            .add(NONE, "    ")
+            .add(STRONG, format!("{}. ", n + 1));
         lines.extend(hanging(&lead, NONE, step, max, ui.color));
     }
     for note in notes {
-        lines.extend(hanging(&Line::new().add(NONE, "    "), DIM, note, max, ui.color));
+        lines.extend(hanging(
+            &Line::new().add(NONE, "    "),
+            DIM,
+            note,
+            max,
+            ui.color,
+        ));
     }
     lines.push(String::new());
     ui.paint(&lines);
 }
 
-/// The pairing code while Settings waits for it: in large digits on the live
-/// screen, on a card of its own on the page until `code_gone`, and plainly
-/// otherwise, with `note` saying where it goes. Not in the log, which is
-/// meant to be pasted somewhere.
 pub fn show_code(code: &str, note: &str) {
-    record("      (the 6-digit pairing code was shown)");
-    web::send(json!({"t": "pin", "title": "Pairing code", "code": code, "note": note}));
+    record("      (показан шестизначный код сопряжения)");
+    web::send(json!({"t": "pin", "title": "Код сопряжения", "code": code, "note": note}));
     let mut ui = ui();
     if ui.mode != Mode::Live {
         let line = format!(
             "{INDENT}{} {}",
-            ui.style(STRONG, "Pairing code:"),
+            ui.style(STRONG, "Код сопряжения:"),
             ui.style(BOLD, &spaced(code))
         );
         ui.plain(&line);
@@ -924,7 +847,12 @@ pub fn show_code(code: &str, note: &str) {
     let max = line_width();
     let mut lines = vec![String::new()];
     for row in big_digits(code) {
-        lines.push(Line::new().add(NONE, "    ").add(STRONG, row).render(max, ui.color));
+        lines.push(
+            Line::new()
+                .add(NONE, "    ")
+                .add(STRONG, row)
+                .render(max, ui.color),
+        );
     }
     lines.push(
         Line::new()
@@ -932,17 +860,21 @@ pub fn show_code(code: &str, note: &str) {
             .add(DIM, spaced(code))
             .render(max, ui.color),
     );
-    lines.extend(hanging(&Line::new().add(NONE, "    "), NONE, note, max, ui.color));
+    lines.extend(hanging(
+        &Line::new().add(NONE, "    "),
+        NONE,
+        note,
+        max,
+        ui.color,
+    ));
     lines.push(String::new());
     ui.paint(&lines);
 }
 
-/// The code from `show_code` is done with: the page takes its card away.
 pub fn code_gone() {
     web::send(json!({"t": "pin_end"}));
 }
 
-/// "481516" as "481 516".
 pub fn spaced(code: &str) -> String {
     let digits: Vec<char> = code.chars().collect();
     if digits.len() == 6 {
@@ -956,8 +888,6 @@ pub fn spaced(code: &str) -> String {
     }
 }
 
-/// Digits three rows tall in heavy box-drawing lines, as siboot-pair shows
-/// its codes (rootshell/src/ui.rs).
 const DIGITS: [[&str; 3]; 10] = [
     ["┏━┓", "┃ ┃", "┗━┛"],
     ["╺┓ ", " ┃ ", "╺┻╸"],
@@ -971,7 +901,6 @@ const DIGITS: [[&str; 3]; 10] = [
     ["┏━┓", "┗━┫", "╺━┛"],
 ];
 
-/// `code`'s three rows in large digits, a wider gap after the third.
 fn big_digits(code: &str) -> [String; 3] {
     let mut rows: [String; 3] = Default::default();
     for (i, d) in code.chars().filter_map(|c| c.to_digit(10)).enumerate() {
@@ -985,15 +914,16 @@ fn big_digits(code: &str) -> [String; 3] {
     rows
 }
 
-/// One of `options`, while the running step shows `title`: the arrows move,
-/// a digit or return picks. None when the user backs out (Esc).
 pub fn choose(title: &str, options: &[String]) -> Option<usize> {
     let picked = match web::page() {
         Some(_) if options.is_empty() => None,
         Some(page) => page.choose(title, options),
         None => choose_prompt(title, options),
     };
-    record_answer(title, picked.and_then(|i| options.get(i)).map(String::as_str));
+    record_answer(
+        title,
+        picked.and_then(|i| options.get(i)).map(String::as_str),
+    );
     picked
 }
 
@@ -1006,7 +936,7 @@ fn choose_prompt(title: &str, options: &[String]) -> Option<usize> {
         for (i, option) in options.iter().enumerate() {
             println!("{INDENT}  {}: {option}", i + 1);
         }
-        let line = ask("Number (empty to stop): ")?;
+        let line = ask("Номер (пустая строка — отмена): ")?;
         return line
             .trim()
             .parse::<usize>()
@@ -1044,7 +974,7 @@ fn choose_prompt(title: &str, options: &[String]) -> Option<usize> {
             lines.push(
                 rail()
                     .add(NONE, " ".repeat(NAME_WIDTH))
-                    .add(DIM, format!("↑↓ ↵{digits} · esc back")),
+                    .add(DIM, format!("↑↓ ↵{digits} · Esc назад")),
             );
             ui.show_dialog(lines, None);
         }
@@ -1075,8 +1005,6 @@ fn choose_prompt(title: &str, options: &[String]) -> Option<usize> {
     picked
 }
 
-/// A line from the terminal, as plain output asks: None at the end of input.
-/// With the page, the page asks for it.
 pub fn ask(prompt: &str) -> Option<String> {
     if let Some(page) = web::page() {
         return page.line(prompt);
@@ -1090,8 +1018,6 @@ pub fn ask(prompt: &str) -> Option<String> {
     }
 }
 
-/// What a live prompt got: an answer, or no keys to read (then the caller
-/// asks the plain way).
 enum Asked<T> {
     Answer(T),
     NoKeys,
@@ -1117,7 +1043,7 @@ fn field(label: &str, placeholder: &str, secret: bool) -> Asked<Option<String>> 
             let mut line = rail().add(BOLD, pad(label, NAME_WIDTH));
             let col = if shown.is_empty() {
                 if nudge {
-                    line = line.add(WARN, "type it, or esc to stop");
+                    line = line.add(WARN, "введите код или нажмите Esc для отмены");
                 } else {
                     line = line.add(DIM, placeholder);
                 }
@@ -1201,7 +1127,6 @@ fn code(label: &str, hints: &[Hint], more: bool) -> Asked<CodeAnswer> {
                     break CodeAnswer::Code(typed);
                 }
             }
-            // How codes are written out: "123 456", "123-456".
             Key::Char(' ' | '-') => {}
             Key::Backspace => {
                 typed.pop();
@@ -1220,7 +1145,6 @@ fn code(label: &str, hints: &[Hint], more: bool) -> Asked<CodeAnswer> {
     Asked::Answer(answer)
 }
 
-/// "4 8 1  _ _ _", and the column of the next box to fill.
 fn code_boxes(typed: &str, digits: usize) -> (Line, usize) {
     let mut line = Line::new();
     let mut col = 0;
@@ -1252,25 +1176,20 @@ fn choice(line: Line, label: &str, on: bool) -> Line {
     }
 }
 
-/// The running step shows `text` instead of its status; returns the status.
 fn swap_status(text: &str) -> String {
     let mut ui = ui();
     std::mem::replace(&mut ui.status, text.to_string())
 }
 
-/// Ctrl-C at a prompt: stop now, as the signal would.
 fn interrupt() -> ! {
-    stop_now("Stopped with Ctrl-C.")
+    stop_now("Остановлено по Ctrl-C.")
 }
 
-/// Stop the run at once, saying `reason`: Ctrl-C at a prompt on the live
-/// screen and, with the page, the signal or the page's Stop. After a run has
-/// already stopped (at the question about the log), it only leaves.
 pub fn stop_now(reason: &str) -> ! {
     {
         let mut ui = ui();
         if !ui.stopped {
-            record(&format!("Stopped: {reason}"));
+            record(&format!("Остановлено: {reason}"));
             let took = clock(ui.run_started.elapsed().as_secs());
             web::send(json!({"t": "failure", "advice": reason, "cause": "", "took": took}));
         }
@@ -1286,7 +1205,7 @@ pub fn stop_now(reason: &str) -> ! {
             ui.end_plain_line();
             flush();
             eprintln!();
-            eprintln!("{} {reason}", ui.style(BAD, "Stopped:"));
+            eprintln!("{} {reason}", ui.style(BAD, "Остановлено:"));
         }
         ui.close();
     }
@@ -1295,7 +1214,6 @@ pub fn stop_now(reason: &str) -> ! {
     std::process::exit(130);
 }
 
-/// Keys can't be read one at a time here after all: finish with plain lines.
 fn degrade() {
     let mut ui = ui();
     if ui.mode == Mode::Live {
@@ -1308,8 +1226,6 @@ fn degrade() {
     }
 }
 
-/// A panic's message goes under the live area, on a terminal left usable.
-/// The panicking thread may hold the lock, so it isn't waited for.
 fn on_panic() {
     if let Some(Ok(mut ui)) = UI.get().map(|m| m.try_lock()) {
         if ui.mode == Mode::Live {
@@ -1323,8 +1239,6 @@ fn on_panic() {
     term::restore();
     term::write("\r\n");
 }
-
-// ---------------------------------------------------------------- drawing
 
 impl Ui {
     fn new() -> Self {
@@ -1350,6 +1264,7 @@ impl Ui {
             plain_label: String::new(),
             plain_percent: None,
             stopped: false,
+            paused: false,
         }
     }
 
@@ -1357,7 +1272,6 @@ impl Ui {
         paint(self.color, style, text)
     }
 
-    /// Redraw the live area, after printing `above` over it: lines that stay.
     fn paint(&mut self, above: &[String]) {
         if self.mode != Mode::Live {
             for line in above {
@@ -1371,8 +1285,6 @@ impl Ui {
         }
         let (cols, rows) = term::size();
         let (lines, cursor) = self.compose(cols, rows);
-        // Synchronized, where the terminal supports it, so a frame never
-        // shows half drawn.
         let mut out = String::from("\x1b[?2026h");
         if self.cursor_row > 0 {
             let _ = write!(out, "\x1b[{}A", self.cursor_row);
@@ -1413,14 +1325,14 @@ impl Ui {
         self.rows = lines.len();
     }
 
-    /// The live area: the running step, then its prompt, or its progress bar
-    /// and the steps to come.
     fn compose(&self, cols: usize, rows: usize) -> (Vec<String>, Option<(usize, usize)>) {
         let max = cols.saturating_sub(1).max(20);
         let mut lines = Vec::new();
         let mut cursor = None;
         if let Some(i) = self.active {
-            let (glyph, style) = if self.dialog.is_some() {
+            let (glyph, style) = if self.paused {
+                ("!", WARN)
+            } else if self.dialog.is_some() {
                 ("◆", STRONG)
             } else {
                 (SPINNER[self.frame % SPINNER.len()], ACCENT)
@@ -1432,7 +1344,8 @@ impl Ui {
                 .add(NONE, " ")
                 .add(BOLD, pad(name, NAME_WIDTH));
             let secs = self.step_started.elapsed().as_secs();
-            let timer = (self.dialog.is_none() && secs >= 3).then(|| format!(" · {}", clock(secs)));
+            let timer = (self.dialog.is_none() && !self.paused && secs >= 3)
+                .then(|| format!(" · {}", clock(secs)));
             lines.extend(wrapped(
                 lead,
                 None,
@@ -1460,8 +1373,6 @@ impl Ui {
                 }
             }
         }
-        // Never taller than the screen, or the next redraw couldn't reach its
-        // top: the steps to come go first, and a prompt keeps its cursor.
         let room = rows.saturating_sub(1).max(1);
         if lines.len() > room {
             let start = match cursor {
@@ -1471,8 +1382,6 @@ impl Ui {
             lines = lines.into_iter().skip(start).take(room).collect();
             cursor = cursor.map(|(row, col)| (row - start, col));
         }
-        // The credit, under a blank line, only where both fit: it never takes
-        // a row from the run.
         let gap = !(lines.is_empty() && self.after_blank);
         if lines.len() + usize::from(gap) < room {
             if gap {
@@ -1489,13 +1398,13 @@ impl Ui {
         )
     }
 
-    /// The running step's last line, to print above the live area as it ends.
     fn settle(&mut self, mark: &str, style: &'static str, text: &str) -> Vec<String> {
         let Some(i) = self.active.take() else {
             return Vec::new();
         };
         self.bar = None;
         self.dialog = None;
+        self.paused = false;
         self.answers.clear();
         let name = self.plan.get(i).copied().unwrap_or("");
         let text_style = if style == BAD { BAD } else { DIM };
@@ -1507,22 +1416,21 @@ impl Ui {
         hanging(&lead, text_style, text, line_width(), self.color)
     }
 
-    /// The failed step and the advice, boxed.
     fn stopped(&mut self, advice: &str, more: bool) -> Vec<String> {
         let took = clock(self.step_started.elapsed().as_secs());
-        let mut above = self.settle("✗", BAD, &format!("stopped after {took}"));
+        let mut above = self.settle("✗", BAD, &format!("остановлено через {took}"));
         let total = clock(self.run_started.elapsed().as_secs());
         above.push(String::new());
         above.extend(boxed(
             self.color,
             BAD,
-            "✗ Stopped",
+            "✗ Остановлено",
             &total,
             &[advice],
             term::size().0,
         ));
         if more {
-            let hint = "Run siboot again with --verbose to see the underlying error.";
+            let hint = "Запустите siboot с --verbose, чтобы увидеть подробности ошибки.";
             above.extend(hanging(
                 &Line::new().add(NONE, "  "),
                 DIM,
@@ -1535,7 +1443,6 @@ impl Ui {
         above
     }
 
-    /// A line that stays, as `style`, under the step lines' text column.
     fn note_lines(&self, style: &'static str, text: &str) -> Vec<String> {
         hanging(
             &Line::new().add(NONE, "  ").add(DIM, "· "),
@@ -1561,8 +1468,6 @@ impl Ui {
     fn close(&mut self) {
         if self.mode == Mode::Live {
             self.mode = Mode::Closed;
-            // The live area stays on screen, credit and all: what comes next
-            // (the shell's prompt) starts on a line under it.
             if self.rows > 0 {
                 let below = self.rows.saturating_sub(self.cursor_row + 1);
                 let down = if below > 0 {
@@ -1576,7 +1481,6 @@ impl Ui {
         }
     }
 
-    /// A plain line, after ending a progress line left open.
     fn plain(&mut self, line: &str) {
         self.end_plain_line();
         println!("{line}");
@@ -1590,8 +1494,6 @@ impl Ui {
         }
     }
 
-    /// A percentage rewritten in place on a terminal (every 5 %), on lines of
-    /// its own elsewhere (every 25 %).
     fn plain_progress(&mut self, label: &str, percent: u64) {
         if self.plain_label != label {
             self.end_plain_line();
@@ -1661,16 +1563,13 @@ impl Bar {
         }
         let left = ((self.total - self.done) as f64 * secs / self.done as f64).ceil() as u64;
         Some(if left < 60 {
-            format!("{left} s left")
+            format!("осталось {left} с")
         } else {
-            format!("{} min left", left.div_ceil(60))
+            format!("осталось {} мин", left.div_ceil(60))
         })
     }
 }
 
-/// `text` after `lead` in at most `limit` lines, the others after `more`
-/// (spaces, when None) and the last cut short if it must be; `tail` (dim)
-/// goes after it when there's room.
 fn wrapped(
     lead: Line,
     more: Option<Line>,
@@ -1685,7 +1584,6 @@ fn wrapped(
     let room = max.saturating_sub(indent).max(10);
     let mut pieces = wrap(text, room);
     if pieces.len() > limit {
-        // Cut by `render`, with its …
         let rest = pieces.split_off(limit - 1).join(" ");
         pieces.push(rest);
     }
@@ -1705,18 +1603,14 @@ fn wrapped(
         .collect()
 }
 
-/// The prompt's rail, under the running step's mark.
 fn rail() -> Line {
     Line::new().add(NONE, "  ").add(ACCENT, "│ ")
 }
 
-/// The terminal's width for a line: one column short, so a full line never
-/// leaves the cursor waiting to wrap.
 fn line_width() -> usize {
     term::size().0.saturating_sub(1).max(20)
 }
 
-/// `text` wrapped after `lead`, its other lines indented to match.
 fn hanging(lead: &Line, style: &'static str, text: &str, max: usize, color: bool) -> Vec<String> {
     let indent = lead.width();
     let room = max.saturating_sub(indent).max(10);
@@ -1734,8 +1628,6 @@ fn hanging(lead: &Line, style: &'static str, text: &str, max: usize, color: bool
         .collect()
 }
 
-/// `paragraphs` in a box `cols` wide at most, with `title` in its top edge and
-/// `right` at the end of it.
 fn boxed(
     color: bool,
     style: &'static str,
@@ -1788,9 +1680,6 @@ fn boxed(
     out
 }
 
-// ---------------------------------------------------------------- text
-
-/// Styled pieces of one line.
 #[derive(Clone, Default)]
 struct Line(Vec<(&'static str, String)>);
 
@@ -1813,7 +1702,6 @@ impl Line {
         self.0.iter().map(|(_, text)| width(text)).sum()
     }
 
-    /// The line for the terminal, cut to `max` columns, with … where it's cut.
     fn render(&self, max: usize, color: bool) -> String {
         let cut = self.width() > max;
         let budget = if cut { max.saturating_sub(1) } else { max };
@@ -1851,8 +1739,6 @@ fn paint(color: bool, style: &str, text: &str) -> String {
     }
 }
 
-/// Columns a character takes in a terminal: none for controls and combining
-/// marks, two for East Asian wide characters and emoji.
 fn char_width(c: char) -> usize {
     let cp = c as u32;
     let zero = cp < 0x20
@@ -1885,7 +1771,6 @@ pub fn width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
-/// `text`, then spaces to `columns`.
 fn pad(text: &str, columns: usize) -> String {
     let gap = columns.saturating_sub(width(text));
     format!(
@@ -1894,7 +1779,6 @@ fn pad(text: &str, columns: usize) -> String {
     )
 }
 
-/// Words in lines of at most `room` columns; a longer word (a URL) is cut.
 fn wrap(text: &str, room: usize) -> Vec<String> {
     let room = room.max(1);
     let mut lines = Vec::new();
@@ -1931,7 +1815,6 @@ fn wrap(text: &str, room: usize) -> Vec<String> {
     lines
 }
 
-/// The end of `text` that fits in `room` columns, after … if cut.
 fn keep_end(text: &str, room: usize) -> String {
     if width(text) <= room {
         return text.to_string();
@@ -1965,7 +1848,6 @@ fn lowercase_first(text: &str) -> String {
     }
 }
 
-/// 0:07, 3:41, 1:02:09.
 fn clock(secs: u64) -> String {
     if secs >= 3600 {
         format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
@@ -1978,8 +1860,6 @@ fn megabytes(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / 1_048_576.0)
 }
 
-// ---------------------------------------------------------------- keys
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Key {
     Char(char),
@@ -1991,26 +1871,19 @@ enum Key {
     Right,
     Tab,
     Esc,
-    /// Ctrl-C.
     Interrupt,
-    /// Ctrl-D, or the end of input.
     End,
-    /// Ctrl-U.
     ClearLine,
-    /// Ctrl-W.
     DeleteWord,
     Ignored,
 }
 
-/// Keys in `bytes`, and how many bytes they took: a sequence cut short at the
-/// end is left for the next read.
 fn parse_keys(bytes: &[u8]) -> (Vec<Key>, usize) {
     let mut keys = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let (key, len) = match bytes[i] {
             0x1b => match bytes.get(i + 1) {
-                // CSI or SS3: parameters, then a final byte.
                 Some(b'[' | b'O') => match bytes[i + 2..]
                     .iter()
                     .position(|b| (0x40..=0x7e).contains(b))
@@ -2071,7 +1944,6 @@ fn parse_keys(bytes: &[u8]) -> (Vec<Key>, usize) {
     (keys, i)
 }
 
-/// The terminal itself: its size, its modes, and keys one at a time.
 mod term {
     use std::collections::VecDeque;
     use std::io::{self, Write};
@@ -2079,13 +1951,10 @@ mod term {
 
     use super::Key;
 
-    /// The terminal's settings before siboot changed them.
     static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
 
-    /// Columns and rows. Without an answer, an iPhone's upright: a guess too
-    /// narrow only wraps sooner, one too wide breaks the redraw.
     pub fn size() -> (usize, usize) {
-        // SAFETY: TIOCGWINSZ fills the winsize it's given, and nothing else.
+        // SAFETY: Нулевое значение winsize допустимо; ioctl заполняет только указанный объект.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0
             && ws.ws_col > 0
@@ -2109,19 +1978,16 @@ mod term {
     }
 
     fn get() -> Option<libc::termios> {
-        // SAFETY: tcgetattr fills the termios it's given.
+        // SAFETY: tcgetattr заполняет termios по действительному указателю на выделенное значение.
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
         (unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut t) } == 0).then_some(t)
     }
 
     fn set(t: &libc::termios) {
-        // SAFETY: a termios read back from this terminal, maybe with flags off.
+        // SAFETY: Сохранённый termios получен для STDIN_FILENO через tcgetattr.
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t) };
     }
 
-    /// For the live screen: keys typed while siboot works don't echo into
-    /// it, and a panic leaves the terminal as it was. False when the terminal
-    /// has no settings to change.
     pub fn start() -> bool {
         let Some(saved) = get() else { return false };
         *SAVED.lock().unwrap_or_else(|e| e.into_inner()) = Some(saved);
@@ -2136,8 +2002,6 @@ mod term {
         true
     }
 
-    /// The settings as they were, and the cursor shown. Nothing where the
-    /// live screen never started: plain output changed neither.
     pub fn restore() {
         if let Some(saved) = SAVED.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             set(saved);
@@ -2145,8 +2009,6 @@ mod term {
         }
     }
 
-    /// Keys one at a time while it lives: no line editing, no echo, and
-    /// Ctrl-C as a key rather than a signal.
     pub struct Keys {
         before: libc::termios,
         pending: Vec<u8>,
@@ -2162,8 +2024,7 @@ mod term {
             raw.c_cc[libc::VMIN] = 1;
             raw.c_cc[libc::VTIME] = 0;
             set(&raw);
-            // What was typed before the question isn't its answer.
-            // SAFETY: drops pending input on this terminal.
+            // SAFETY: tcflush вызывается для стандартного ввода, открытого как терминал.
             unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
             Some(Keys {
                 before,
@@ -2178,7 +2039,7 @@ mod term {
                     return key;
                 }
                 let mut buf = [0u8; 256];
-                // SAFETY: reads at most buf.len() bytes into buf.
+                // SAFETY: buf выделен на стеке, а read запишет не более его длины байтов.
                 let n =
                     unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
                 if n < 0 {
@@ -2205,8 +2066,6 @@ mod term {
     }
 }
 
-/// tracing's output on the live screen: each line printed above the live
-/// area, so a library's warning doesn't tear it.
 pub struct LogLines;
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogLines {
@@ -2255,15 +2114,14 @@ mod tests {
     fn a_line_is_cut_to_the_screen_with_an_ellipsis() {
         let line = Line::new()
             .add(BOLD, "Apple ID  ")
-            .add(NONE, "signing in through new.ani.sidestore.io");
+            .add(NONE, "вход через new.ani.sidestore.io");
         let cut = line.render(20, false);
-        assert_eq!(cut, "Apple ID  signing i…");
+        assert_eq!(cut, "Apple ID  вход через…");
         assert_eq!(width(&cut), 20);
         assert_eq!(
             line.render(80, false),
-            "Apple ID  signing in through new.ani.sidestore.io"
+            "Apple ID  вход через new.ani.sidestore.io"
         );
-        // Styles close before the cut.
         let styled = line.render(12, true);
         assert!(styled.starts_with("\x1b[1mApple ID  \x1b[0m"), "{styled:?}");
         assert!(styled.ends_with('…'));
@@ -2272,8 +2130,8 @@ mod tests {
     #[test]
     fn words_wrap_and_long_ones_are_cut() {
         assert_eq!(
-            wrap("Keep Minis open until siboot is done", 16),
-            ["Keep Minis open", "until siboot is", "done"]
+            wrap("Не закрывайте Minis до завершения siboot", 16),
+            ["Не закрывайте", "Minis до", "завершения", "siboot"]
         );
         assert_eq!(wrap("", 10), [""]);
         assert_eq!(
@@ -2281,7 +2139,7 @@ mod tests {
             ["https://ex", "ample.org/", "a/long/pat", "h"]
         );
         for line in wrap(
-            "The iPhone opened a tunnel port but 10.7.0.1:61000 can't be reached.",
+            "iPhone открыл туннельный порт, но 10.7.0.1:61000 недоступен.",
             24,
         ) {
             assert!(width(&line) <= 24, "{line}");
@@ -2314,10 +2172,8 @@ mod tests {
             ]
         );
         assert_eq!(used, 14);
-        // A lone escape, and CRLF as one return.
         assert_eq!(parse_keys(b"\x1b").0, [Key::Esc]);
         assert_eq!(parse_keys(b"\r\n").0, [Key::Enter]);
-        // UTF-8 whole, and a sequence cut short waits for the rest.
         assert_eq!(
             parse_keys("é•".as_bytes()).0,
             [Key::Char('é'), Key::Char('•')]
@@ -2367,18 +2223,18 @@ mod tests {
         let lines = boxed(
             false,
             GOOD,
-            "✓ Done",
+            "✓ Готово",
             "3:41",
             &[
-                "SideInstaller is installed.",
-                "Free accounts' apps last 7 days.",
+                "SideInstaller установлен.",
+                "Приложения бесплатной учётной записи работают 7 дней.",
             ],
             46,
         );
         let widths: Vec<usize> = lines.iter().map(|l| width(l)).collect();
         assert!(widths.iter().all(|w| *w == widths[0]), "{lines:#?}");
         assert!(widths[0] <= 45);
-        assert!(lines[0].contains("✓ Done") && lines[0].contains("3:41"));
+        assert!(lines[0].contains("✓ Готово") && lines[0].contains("3:41"));
         assert!(lines.last().unwrap().trim_start().starts_with('╰'));
     }
 
@@ -2387,7 +2243,7 @@ mod tests {
         let lead = Line::new()
             .add(NONE, "  ")
             .add(NONE, "✓ ")
-            .add(NONE, pad("Connect", NAME_WIDTH));
+            .add(NONE, pad("Сеть", NAME_WIDTH));
         let lines = hanging(
             &lead,
             NONE,
@@ -2395,7 +2251,7 @@ mod tests {
             30,
             false,
         );
-        assert_eq!(lines[0], "  ✓ Connect   Tom's iPhone, an");
+        assert_eq!(lines[0], "  ✓ Сеть       Tom's iPhone, an");
         assert!(
             lines[1..]
                 .iter()
@@ -2410,9 +2266,7 @@ mod tests {
             assert!(glyph.iter().all(|row| width(row) == 3), "{d}");
         }
         let rows = big_digits("481516");
-        // Six digits of three, four gaps of one, one of three.
         assert!(rows.iter().all(|row| width(row) == 25), "{rows:#?}");
-        // Indented by four, it fits in Minis's terminal upright (about 45).
         assert!(4 + width(&rows[0]) <= 40);
         assert_eq!(rows[0], "╻ ╻ ┏━┓ ╺┓    ┏━╸ ╺┓  ┏━╸");
         assert_eq!(spaced("481516"), "481 516");
@@ -2423,8 +2277,8 @@ mod tests {
     fn a_long_status_takes_two_lines_then_is_cut() {
         let lead = Line::new()
             .add(NONE, "  ⠋ ")
-            .add(NONE, pad("Pairing", NAME_WIDTH));
-        let text = "rootshell is offering the pairing file it made";
+            .add(NONE, pad("Сопряжение", NAME_WIDTH));
+        let text = "rootshell предлагает созданный файл сопряжения";
         let lines: Vec<String> = wrapped(lead.clone(), None, NONE, text, Some(" · 0:07"), 42, 2)
             .iter()
             .map(|l| l.render(42, false))
@@ -2432,18 +2286,16 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "  ⠋ Pairing   rootshell is offering the",
-                "              pairing file it made · 0:07"
+                "  ⠋ Сопряжен  rootshell предлагает",
+                "              созданный файл сопряжения · 0:07"
             ]
         );
-        // No room for the timer: it waits.
         let narrow = wrapped(lead.clone(), None, NONE, text, Some(" · 0:07"), 40, 2);
         assert!(!narrow[1].render(40, false).contains("0:07"));
-        let long = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        let long = "один два три четыре пять шесть семь восемь девять десять одиннадцать двенадцать тринадцать";
         let lines = wrapped(lead, None, NONE, long, None, 30, 2);
         assert_eq!(lines.len(), 2);
         assert!(lines[1].render(30, false).ends_with('…'));
-        // A prompt's hint keeps its rail on every line.
         let rail_lead = rail().add(NONE, " ".repeat(NAME_WIDTH));
         let hint = wrapped(rail_lead.clone(), Some(rail_lead), DIM, long, None, 34, 2);
         assert!(hint.iter().all(|l| l.render(34, false).starts_with("  │ ")));
@@ -2451,39 +2303,34 @@ mod tests {
 
     #[test]
     fn names_pad_to_their_column() {
-        assert_eq!(pad("Pairing", NAME_WIDTH), "Pairing   ");
-        assert_eq!(width(&pad("Handover", NAME_WIDTH)), NAME_WIDTH);
-        // A name as long as the column still gets a space after it.
-        assert_eq!(pad("Developers", NAME_WIDTH), "Developers ");
+        assert_eq!(pad("Сопряжение", NAME_WIDTH), "Сопряжение ");
+        assert_eq!(width(&pad("Передача", NAME_WIDTH)), NAME_WIDTH);
+        assert_eq!(pad("Разработчики", NAME_WIDTH), "Разработчики");
     }
 
     #[test]
     fn the_credit_ends_the_live_area_while_there_is_room() {
         let credit = format!("  {CREDIT}");
         let mut ui = Ui::new();
-        ui.plan = vec!["Check", "Pairing", "Connect"];
+        ui.plan = vec!["Проверка", "Сопряжение", "Подключение"];
         ui.active = Some(0);
-        ui.status = "reaching GitHub".to_string();
+        ui.status = "проверка доступности GitHub".to_string();
         let (lines, _) = ui.compose(46, 40);
         assert_eq!(lines.len(), 5, "{lines:#?}");
         assert_eq!(lines[3], "");
         assert_eq!(lines[4], credit);
-        // Under a prompt, which keeps its cursor.
         ui.dialog = Some(Dialog {
-            lines: vec![rail().add(BOLD, pad("Code", NAME_WIDTH))],
+            lines: vec![rail().add(BOLD, pad("Код", NAME_WIDTH))],
             cursor: Some((0, TEXT_COLUMN)),
         });
         let (lines, cursor) = ui.compose(46, 40);
         assert_eq!(lines.last(), Some(&credit));
         assert_eq!(cursor, Some((1, TEXT_COLUMN)));
         ui.dialog = None;
-        // Alone, after the header or a box: their blank line is its own.
         ui.active = None;
         assert_eq!(ui.compose(46, 40).0, std::slice::from_ref(&credit));
-        // Alone after a line that isn't blank: one of its own.
         ui.after_blank = false;
         assert_eq!(ui.compose(46, 40).0, [String::new(), credit.clone()]);
-        // A screen too short for it keeps the run's lines.
         ui.active = Some(0);
         assert_eq!(ui.compose(46, 6).0.last(), Some(&credit));
         for rows in [3, 4, 5] {
@@ -2491,10 +2338,9 @@ mod tests {
             assert!(!lines.contains(&credit), "{rows}: {lines:#?}");
             assert_eq!(lines.len(), 3.min(rows - 1), "{rows}: {lines:#?}");
         }
-        // On a narrow one it's cut like any other line (to 20 columns at least).
         let (lines, _) = ui.compose(20, 40);
         assert!(lines.iter().all(|l| width(l) <= 20), "{lines:#?}");
-        assert_eq!(lines.last().map(String::as_str), Some("  A project by Friz…"));
+        assert_eq!(lines.last().map(String::as_str), Some("  Проект ripcats…"));
     }
 
     #[test]

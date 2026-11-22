@@ -1,23 +1,7 @@
-//! Step 4: sign in to the user's Apple Account, as SideInstaller does.
-//!
-//! The sign-in itself is rust-core's `apple_session::open`, compiled here
-//! unchanged (see main.rs): a saved developer token first, then a full
-//! GrandSlam sign-in with two-factor, the -80046 skip for Android-ADI servers,
-//! and the current-Mac identity rules. What's added is the terminal: the
-//! prompts, the order servers are tried in, and which team signs when Apple
-//! lists more than one (team.rs).
-//!
-//! Since 0.20.0 siboot also remembers the Apple Accounts that signed in
-//! (saved.rs) and offers them, and tries the token saved with one before it
-//! asks for the password, which then only comes when Apple wants it again.
-//! `open` takes the password up front, so that first try is siboot's own: the
-//! same two tries of the token `open` makes, without the login it falls back
-//! to.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use isideload::anisette::{
     remote_v3::RemoteV3AnisetteProvider, AnisetteDataGenerator, AnisetteProvider,
@@ -38,6 +22,8 @@ use rootcause::Report;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(90);
+
 use crate::apple_session;
 use crate::error_text::report_text;
 use crate::fail::{Fail, Result};
@@ -45,11 +31,6 @@ use crate::saved;
 use crate::team::{self, Kind};
 use crate::{ui, Args};
 
-/// Anisette servers on Apple's macOS ADI library, in the order SideInstaller's
-/// Auto tries them: lillq's pool (`POOL`), then the others
-/// (`AnisetteServer.macADIOrder`), then its Windows-library one. Android-library
-/// servers are left out, as there: Apple refuses the token they lead to
-/// (-80046) after the password and code have gone through.
 pub const SERVERS: &[&str] = &[
     POOL,
     "https://new.ani.sidestore.io",
@@ -61,26 +42,14 @@ pub const SERVERS: &[&str] = &[
     "https://win.ani.sidestore.io",
 ];
 
-/// anisette.lillq.me, a pool of servers that checks hourly which clients Apple
-/// lets through and hands out one that passes (SideInstaller's
-/// `ADILibrary.pool`), first since 0.20.1. Its anisette identities work on no
-/// other server, and theirs not on it, so it's tried after the servers that
-/// share the last good one's identity: a saved token only works with the
-/// identity it was issued to.
 const POOL: &str = "https://anisette.lillq.me";
 
-/// The name the signing certificate is made for, as Xcode names a Mac's.
 const MACHINE_NAME: &str = "siboot";
 
 pub struct Session {
     pub sideloader: Sideloader,
-    /// The developer team signing for it, as the step's summary: "paid team
-    /// Frizzle (ABCDE12345)".
     pub team: String,
-    /// Free or paid, when Apple listed more than one team to pick from.
     pub kind: Kind,
-    /// Whether it's the first team Apple lists, the one SideInstaller renews
-    /// itself with.
     pub first: bool,
 }
 
@@ -88,12 +57,10 @@ pub async fn sign_in(args: &Args) -> Result<Session> {
     let storage = args.home.join("isideload");
     std::fs::create_dir_all(&storage).map_err(|e| {
         Fail::new(
-            format!("Couldn't create {}.", storage.display()),
+            format!("Не удалось создать {}.", storage.display()),
             e.to_string(),
         )
     })?;
-    // Before this sign-in saves a token, so an account new here is said to
-    // be kept.
     start_list(&args.home, &storage);
     let apple_id = match args
         .apple_id
@@ -103,14 +70,10 @@ pub async fn sign_in(args: &Args) -> Result<Session> {
         Some(id) => id,
         None => which_account(&args.home, &storage).unwrap_or_default(),
     };
-    // Apple Account names aren't case-sensitive, but GrandSlam's SRP proof
-    // hashes the name exactly as sent, so one typed with a capital (a phone
-    // keyboard may add one) can fail as a wrong password. Lowercase, it also
-    // names one storage folder per account, however it was typed.
     let typed = apple_id.trim().to_string();
     let apple_id = typed.to_lowercase();
     if apple_id.is_empty() {
-        return Err(Fail::by_user("No Apple Account given."));
+        return Err(Fail::by_user("Учётная запись Apple не указана."));
     }
     adopt_folder_typed_as(&storage, &typed, &apple_id);
 
@@ -118,8 +81,6 @@ pub async fn sign_in(args: &Args) -> Result<Session> {
     let password = match std::env::var("SIBOOT_PASSWORD") {
         Ok(p) if !p.is_empty() => p,
         _ => {
-            // A sign-in saved with the account first: while Apple takes it,
-            // there's no password to ask for.
             match saved_token(&storage, &apple_id, unix_now()) {
                 Saved::Usable(token) => match with_token(&token, &servers, &storage).await? {
                     ByToken::Opened(server, developer, teams) => {
@@ -140,12 +101,22 @@ pub async fn sign_in(args: &Args) -> Result<Session> {
 
     let mut last_error = String::new();
     for server in &servers {
-        ui::status(&format!("signing in through {}", host_of(server)));
-        match apple_session::open(
-            &apple_id, &password, server, &storage, true, two_factor, "Apple ID",
+        ui::status(&format!("вход через {}", host_of(server)));
+        let result = tokio::time::timeout(
+            SIGN_IN_TIMEOUT,
+            apple_session::open(
+                &apple_id, &password, server, &storage, true, two_factor, "Apple ID",
+            ),
         )
-        .await
-        {
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "Время ожидания входа Apple ID истекло через {} с",
+                SIGN_IN_TIMEOUT.as_secs()
+            )),
+        };
+        match result {
             Ok((developer, teams)) => {
                 let how = Signed::WithPassword;
                 return signed_in(args, &storage, &apple_id, server, developer, teams, how).await;
@@ -155,7 +126,7 @@ pub async fn sign_in(args: &Args) -> Result<Session> {
                     return Err(stopped(advice, e));
                 }
                 ui::warn(&format!(
-                    "{} didn't work: {}",
+                    "Сервер {} не сработал: {}",
                     host_of(server),
                     first_line(&e)
                 ));
@@ -166,16 +137,12 @@ pub async fn sign_in(args: &Args) -> Result<Session> {
     Err(no_server(servers.len(), last_error))
 }
 
-/// How the developer session came, for the line that says it's open.
 #[derive(Clone, Copy)]
 enum Signed {
     WithPassword,
-    /// The token saved with the account, so nothing was asked.
     WithoutPassword,
 }
 
-/// What's left once Apple has opened a developer session: remembering the
-/// server and the Apple Account, the team, and the sideloader that signs.
 async fn signed_in(
     args: &Args,
     storage: &Path,
@@ -186,8 +153,6 @@ async fn signed_in(
     how: Signed,
 ) -> Result<Session> {
     remember_server(&args.home, server);
-    // Before the team, so a sign-in that went through is kept even if no
-    // team is picked.
     let new = remember_account(&args.home, apple_id);
     let (picked, kind, first) = pick_team(&mut developer, teams).await?;
     let team = team::summary(picked.name.as_deref(), &picked.team_id, kind);
@@ -199,12 +164,10 @@ async fn signed_in(
         .storage(Box::new(FsStorage::new(storage.to_path_buf())))
         .machine_name(MACHINE_NAME.to_string())
         .build();
-    // `open` has just listed the teams, so the one picked is handed over
-    // rather than listed again.
     sideloader.set_team(picked);
     ui::ok(&match how {
-        Signed::WithPassword => format!("signed in — {team}"),
-        Signed::WithoutPassword => format!("signed in without the password — {team}"),
+        Signed::WithPassword => format!("вход выполнен — {team}"),
+        Signed::WithoutPassword => format!("вход выполнен без пароля — {team}"),
     });
     if new {
         ui::note(saved::SAVED);
@@ -225,45 +188,35 @@ fn stopped(advice: &'static str, error: String) -> Fail {
 
 fn no_server(servers: usize, last_error: String) -> Fail {
     Fail::new(
-        format!("Couldn't sign in through any of {servers} anisette servers. Try again later."),
+        format!("Не удалось войти через серверы anisette ({servers}). Попробуйте позже."),
         last_error,
     )
 }
 
 fn ask_email() -> Option<String> {
     ui::ask_text(
-        "sign in to your Apple Account",
-        "Email",
-        "your Apple Account",
-        "Apple Account email: ",
+        "войдите в учётную запись Apple",
+        "Электронная почта",
+        "адрес учётной записи Apple",
+        "Электронная почта Apple ID: ",
     )
 }
 
 fn ask_password() -> Result<String> {
     let password = ui::ask_secret(
-        "sign in to your Apple Account",
-        "Password",
-        "it goes only to Apple",
-        "Password (not shown; it goes only to Apple): ",
+        "войдите в учётную запись Apple",
+        "Пароль",
+        "он будет отправлен только в Apple",
+        "Пароль (не отображается; отправляется только в Apple): ",
     )
-    .map_err(|e| {
-        Fail::new(
-            "Couldn't read the password from the terminal.",
-            e.to_string(),
-        )
-    })?
+    .map_err(|e| Fail::new("Не удалось прочитать пароль из терминала.", e.to_string()))?
     .unwrap_or_default();
     if password.is_empty() {
-        return Err(Fail::by_user("No password given."));
+        return Err(Fail::by_user("Пароль не указан."));
     }
     Ok(password)
 }
 
-// ------------------------------------------------- remembered Apple Accounts
-
-/// The Apple Account to sign in with when none was given: one of those saved,
-/// picked from a menu that can also forget one, or typed. None when the user
-/// stops.
 fn which_account(home: &Path, storage: &Path) -> Option<String> {
     loop {
         let accounts = saved::list(home);
@@ -277,27 +230,23 @@ fn which_account(home: &Path, storage: &Path) -> Option<String> {
                 if let Some(email) = ask_email() {
                     return Some(email);
                 }
-                // Back from the field: to the menu.
             }
             saved::Pick::Forget => forget_one(home, storage, &accounts),
         }
     }
 }
 
-/// The first time, the Apple Accounts with a sign-in saved here already
-/// (0.19.1 and older kept the token, but no list) start the list.
 fn start_list(home: &Path, storage: &Path) {
     if saved::exists(home) {
         return;
     }
     if let Err(e) = saved::start(home, &signed_in_before(storage)) {
-        ui::detail(&format!("couldn't save the list of Apple Accounts: {e}"));
+        ui::detail(&format!(
+            "Не удалось сохранить список учётных записей Apple: {e}"
+        ));
     }
 }
 
-/// Apple Accounts with a sign-in saved in isideload's store, the latest
-/// first. Only a sign-in in its own account's folder counts, so the email it
-/// names is that account's.
 fn signed_in_before(storage: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(storage) else {
         return Vec::new();
@@ -314,23 +263,18 @@ fn signed_in_before(storage: &Path) -> Vec<String> {
     found.into_iter().map(|(_, apple_id)| apple_id).collect()
 }
 
-/// Puts the Apple Account first on the list. True when it wasn't on it, so
-/// the user hears it's kept.
 fn remember_account(home: &Path, apple_id: &str) -> bool {
     match saved::remember(home, apple_id) {
         Ok(new) => new,
         Err(e) => {
             ui::detail(&format!(
-                "couldn't save the Apple Account for next time: {e}"
+                "Не удалось сохранить учётную запись Apple для следующего запуска: {e}"
             ));
             false
         }
     }
 }
 
-/// Forgets one of `accounts`, and the sign-in saved with it, once the user has
-/// said which and confirmed. Its signing key stays, as SideInstaller keeps one
-/// for an Apple ID it removes: signing in again then needs no new certificate.
 fn forget_one(home: &Path, storage: &Path, accounts: &[String]) {
     let index = match accounts {
         [_] => Some(0),
@@ -339,42 +283,32 @@ fn forget_one(home: &Path, storage: &Path, accounts: &[String]) {
     let Some(email) = index.and_then(|i| accounts.get(i)) else {
         return;
     };
-    if !ui::confirm(&format!("forget {email}?"), false) {
+    if !ui::confirm(&format!("забыть {email}?"), false) {
         return;
     }
     match saved::forget(home, email) {
         Ok(_) => {
             if apple_session::forget(storage, email) {
-                ui::ok(&format!("forgot {email} and its saved sign-in"));
+                ui::ok(&format!("Удалена запись {email} и сохранённый вход"));
             } else {
-                ui::ok(&format!("forgot {email}"));
+                ui::ok(&format!("Удалена запись {email}"));
             }
         }
-        Err(e) => ui::warn(&format!("couldn't forget {email}: {e}")),
+        Err(e) => ui::warn(&format!("Не удалось удалить {email}: {e}")),
     }
 }
 
-// ------------------------------------------------------ the saved sign-in
-
-/// apple_session.rs keeps an account's developer token in this file, in the
-/// account's folder beside its signing key.
 const SESSION_FILE: &str = "developer_session.json";
 
-/// Signs in again this long before Apple's stated expiry, as apple_session.rs
-/// does, rather than race it.
 const EXPIRY_MARGIN_SECS: u64 = 10 * 60;
 
-/// The developer token apple_session.rs saved after a sign-in, as it writes it
-/// (its `SavedSession`). No `Debug`, so the token can't reach a log line.
 #[derive(Deserialize)]
 struct SavedToken {
     apple_id: String,
     adsid: String,
     token: String,
-    /// Both as Apple sent them.
     duration: u64,
     expiry: u64,
-    /// Unix seconds.
     saved_at: u64,
 }
 
@@ -383,9 +317,6 @@ impl SavedToken {
         serde_json::from_slice(&std::fs::read(path).ok()?).ok()
     }
 
-    /// When the token expires, as apple_session.rs reads it: Apple's stated
-    /// expiry, else its duration from when it was saved. None when Apple
-    /// gave neither: then it's tried anyway.
     fn expires_at(&self) -> Option<u64> {
         apple_session::stated_expiry(self.expiry)
             .or_else(|| (self.duration > 0).then(|| self.saved_at.saturating_add(self.duration)))
@@ -399,29 +330,25 @@ impl SavedToken {
         }
     }
 
-    /// For the details: how long Apple said it lasts from `now`.
     fn lifetime(&self, now: u64) -> String {
         match self.expires_at() {
             Some(at) if at > now => {
                 let left = at - now;
                 format!(
-                    "Apple's sign-in lasts {}d {}h more",
+                    "Вход Apple действует ещё {} дн. {} ч",
                     left / 86_400,
                     left % 86_400 / 3_600
                 )
             }
-            Some(_) => "Apple's sign-in is past its expiry".into(),
-            None => "Apple gave the sign-in no expiry".into(),
+            Some(_) => "Срок действия входа Apple истёк".into(),
+            None => "Apple не указала срок действия входа".into(),
         }
     }
 }
 
 enum Saved {
-    /// A token that hasn't expired: worth trying before the password.
     Usable(SavedToken),
-    /// One that has: Apple needs the password again.
     RunOut,
-    /// None, or one that can't be read or names another account.
     None,
 }
 
@@ -448,34 +375,27 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// What the saved token came to.
 enum ByToken {
-    /// Apple opened a developer session with it, through this server.
     Opened(String, DeveloperSession, Vec<DeveloperTeam>),
-    /// Apple turned it down: only the password signs in now.
     Refused,
 }
 
-/// Signs in with the saved token through each server in turn, as the
-/// password would, never logging in. Stops as `sign_in` does when no server
-/// gets it to Apple, or Apple is limiting sign-ins: the password wouldn't
-/// help either, as `open` doesn't log in for those.
 async fn with_token(token: &SavedToken, servers: &[String], storage: &Path) -> Result<ByToken> {
     let mut last_error = String::new();
     for server in servers {
-        ui::status(&format!("signing in through {}", host_of(server)));
+        ui::status(&format!("вход через {}", host_of(server)));
         match open_with_token(token, server, storage).await {
             Ok((developer, teams)) => {
                 let lifetime = token.lifetime(unix_now());
                 tracing::info!(
-                    "Apple ID: signed in with the saved token, so no password ({lifetime})"
+                    "Apple ID: вход по сохранённому токену, пароль не нужен ({lifetime})"
                 );
-                ui::detail(&format!("used the saved sign-in: {lifetime}"));
+                ui::detail(&format!("использован сохранённый вход: {lifetime}"));
                 return Ok(ByToken::Opened(server.clone(), developer, teams));
             }
             Err(Tried::Answered(e)) if refuses_token(&e) => {
                 tracing::info!(
-                    "Apple ID: Apple no longer takes the saved token ({}); asking for the password",
+                    "Apple ID: Apple больше не принимает сохранённый токен ({}); запрашивается пароль",
                     first_line(&e)
                 );
                 return Ok(ByToken::Refused);
@@ -485,7 +405,7 @@ async fn with_token(token: &SavedToken, servers: &[String], storage: &Path) -> R
                     return Err(stopped(advice, e));
                 }
                 ui::warn(&format!(
-                    "{} didn't work: {}",
+                    "Сервер {} не сработал: {}",
                     host_of(server),
                     first_line(&e)
                 ));
@@ -496,19 +416,11 @@ async fn with_token(token: &SavedToken, servers: &[String], storage: &Path) -> R
     Err(no_server(servers.len(), last_error))
 }
 
-/// Why the token didn't open a session through a server.
 enum Tried {
-    /// The anisette server, the network or the client failed before Apple
-    /// had it.
     NotReached(String),
-    /// What Apple's developer portal answered.
     Answered(String),
 }
 
-/// The saved token through `server`, tried as `apple_session::open` tries it
-/// before it logs in: on a GrandSlam client without the URL bag first, since
-/// the developer portal doesn't need it, then on one with it, which can also
-/// provision the anisette identity.
 async fn open_with_token(
     token: &SavedToken,
     server: &str,
@@ -546,13 +458,11 @@ async fn open_with_token(
     match without_url_bag.await {
         Ok(opened) => return Ok(opened),
         Err(Tried::NotReached(e) | Tried::Answered(e)) => tracing::info!(
-            "Apple ID: couldn't use the saved token straight away ({}); trying it with a full sign-in client",
+            "Apple ID: не удалось сразу использовать сохранённый токен ({}); повторная попытка через полный вход",
             first_line(&e)
         ),
     }
 
-    // Only fetches the anisette server's client info and the URL bag; no
-    // sign-in.
     let account = AppleAccount::builder(&token.apple_id)
         .anisette_provider(anisette()?)
         .build()
@@ -576,17 +486,12 @@ async fn open_with_token(
     Ok((developer, teams))
 }
 
-/// Whether Apple's answer turned the token down, so only the password signs
-/// in now. Not when the anisette server or the network failed on the way,
-/// Apple was busy, or it refused the Apple Account itself (1102, 2160):
-/// `open` doesn't log in again for those either (its `is_transient` and
-/// `is_account_refusal`).
 fn refuses_token(error: &str) -> bool {
     let e = error.to_lowercase();
     let transient = [
         "anisette",
         "error sending request",
-        "timed out",
+        "истекло время ожидания",
         "(429 ",
         "server error (5",
     ]
@@ -596,18 +501,12 @@ fn refuses_token(error: &str) -> bool {
     !transient && !account
 }
 
-/// The team that signs: the only one Apple lists, or the one picked when it
-/// lists more (a paid membership and the free team every account has, or a
-/// company's team), each marked free or paid. Apple's order is kept, so the
-/// menu starts on the first: the team siboot took before 0.19.0, and the one
-/// SideInstaller renews itself with. Also says whether that's the one picked.
 async fn pick_team(
     developer: &mut DeveloperSession,
     mut teams: Vec<DeveloperTeam>,
 ) -> Result<(DeveloperTeam, Kind, bool)> {
-    let none = "Signed in, but Apple didn't list a developer team.";
+    let none = "Вход выполнен, но Apple не сообщила команду разработчиков.";
     if teams.is_empty() {
-        // Asked once more, as isideload's `get_team` did before 0.19.0.
         teams = developer
             .list_teams()
             .await
@@ -616,15 +515,15 @@ async fn pick_team(
     if teams.len() < 2 {
         let only = teams
             .pop()
-            .ok_or_else(|| Fail::new(none, "No developer teams available"))?;
+            .ok_or_else(|| Fail::new(none, "Команды разработчиков отсутствуют"))?;
         return Ok((only, Kind::Unknown, true));
     }
-    ui::status("reading your teams");
+    ui::status("получение списка команд разработчиков");
     let known = match list_kinds(developer).await {
         Ok(known) => known,
         Err(e) => {
             ui::detail(&format!(
-                "couldn't tell free teams from paid ones: {}",
+                "не удалось отличить бесплатные команды от платных: {}",
                 first_line(&crate::error_text::report_text(&e))
             ));
             HashMap::new()
@@ -643,13 +542,10 @@ async fn pick_team(
     ui::note(team::NOTE);
     match ui::choose(team::QUESTION, &labels) {
         Some(i) if i < teams.len() => Ok((teams.swap_remove(i), kinds[i], i == 0)),
-        _ => Err(Fail::by_user("No developer team picked.")),
+        _ => Err(Fail::by_user("Команда разработчиков не выбрана.")),
     }
 }
 
-/// Each team's kind, from Apple's listTeams asked again: isideload's
-/// `DeveloperTeam` leaves out the memberships, and they're what tells a free
-/// team from a paid one. Only asked when there's a choice to make.
 async fn list_kinds(
     developer: &mut DeveloperSession,
 ) -> std::result::Result<HashMap<String, Kind>, Report> {
@@ -663,10 +559,6 @@ async fn list_kinds(
     Ok(team::kinds(&listed))
 }
 
-/// `pick` alone when given; otherwise the last server that worked, then the
-/// rest of `SERVERS`: when the last one was a macOS server other than lillq's
-/// (`POOL`), the others that take its identity come before lillq, as in
-/// SideInstaller's `AnisetteServer.candidates`.
 fn candidates(pick: Option<&str>, last: Option<&str>) -> Vec<String> {
     if let Some(pick) = pick {
         return vec![pick.trim().trim_end_matches('/').to_string()];
@@ -675,8 +567,16 @@ fn candidates(pick: Option<&str>, last: Option<&str>) -> Vec<String> {
     let last = last.map(trim).filter(|s| !s.is_empty());
     let shares_identity = |s: &str| s != POOL && s != WINDOWS_SERVER;
     let mut order: Vec<String> = last.iter().cloned().collect();
-    if last.as_deref().is_some_and(|l| SERVERS.contains(&l) && shares_identity(l)) {
-        order.extend(SERVERS.iter().filter(|s| shares_identity(**s)).map(|s| s.to_string()));
+    if last
+        .as_deref()
+        .is_some_and(|l| SERVERS.contains(&l) && shares_identity(l))
+    {
+        order.extend(
+            SERVERS
+                .iter()
+                .filter(|s| shares_identity(**s))
+                .map(|s| s.to_string()),
+        );
     }
     order.extend(SERVERS.iter().map(|s| s.to_string()));
     let mut out: Vec<String> = Vec::new();
@@ -688,7 +588,6 @@ fn candidates(pick: Option<&str>, last: Option<&str>) -> Vec<String> {
     out
 }
 
-/// The one server in `SERVERS` on Apple's Windows library.
 const WINDOWS_SERVER: &str = "https://win.ani.sidestore.io";
 
 fn last_server_path(home: &Path) -> PathBuf {
@@ -706,25 +605,20 @@ fn remember_server(home: &Path, server: &str) {
     let _ = std::fs::write(last_server_path(home), server);
 }
 
-/// The user said no to every way of getting the code: not a problem to log.
-const CANCELLED: &str = "Sign-in cancelled.";
+const CANCELLED: &str = "Вход отменён.";
 
-/// Advice when another server can't help: the same account would meet the
-/// same answer, and retrying risks Apple locking it.
 fn stops_sign_in(error: &str) -> Option<&'static str> {
-    // Codes from SideInstaller's `Engine.credentialErrorCodes`.
     if ["-20101", "-20970", "-22406"]
         .iter()
         .any(|c| error.contains(c))
     {
         return Some(
-            "Apple rejected the Apple Account or password. Check them and run siboot again. If \
-             you're sure they're right, Apple may be limiting sign-ins: wait a while first.",
+            "Apple отклонила учётную запись или пароль. Проверьте их и снова запустите siboot. Если данные верны, Apple могла временно ограничить вход — подождите и повторите попытку.",
         );
     }
     if error.contains("429") || error.to_ascii_lowercase().contains("too many") {
         return Some(
-            "Apple is limiting sign-in attempts for now. Wait a while, then run siboot again.",
+            "Apple временно ограничила попытки входа. Подождите и снова запустите siboot.",
         );
     }
     if error.contains("No 2FA") {
@@ -733,10 +627,6 @@ fn stops_sign_in(error: &str) -> Option<&'static str> {
     None
 }
 
-/// isideload keeps an account's signing key and saved sign-in in
-/// `<sha256(email)>/`. One made under the email as typed, before siboot
-/// lowercased it, is moved to the lowercase name, so the account keeps its key
-/// and certificate instead of making another.
 fn adopt_folder_typed_as(storage: &Path, typed: &str, apple_id: &str) {
     if typed == apple_id {
         return;
@@ -758,8 +648,6 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or(text)
 }
 
-/// isideload's two-factor callback: the prompt runs on a blocking thread, since
-/// it waits on the terminal.
 fn two_factor(
     params: TwoFactorCallbackParams,
 ) -> impl std::future::Future<Output = std::result::Result<TwoFactorCallbackResponse, Report>> + Send
@@ -773,9 +661,7 @@ fn two_factor(
     }
 }
 
-/// What Apple is waiting for, owned so it can cross to the prompt's thread.
 struct Prompt {
-    /// Where the pending code went.
     method: Method,
     selected: Option<u32>,
     last_error: Option<String>,
@@ -787,7 +673,6 @@ enum Method {
     Devices,
     Sms,
     Voice,
-    /// Nothing is pending: the user picks.
     Choose,
 }
 
@@ -833,54 +718,52 @@ impl Prompt {
             .unwrap_or_else(|| "your trusted number".into())
     }
 
-    /// The other ways to get a code, as a menu: each trusted number (texted,
-    /// or called), the devices, again, or not at all.
     fn ways(&self) -> Vec<(String, TwoFactorCallbackResponse)> {
         let mut ways = Vec::new();
         for (id, number, mode) in &self.numbers {
-            // "voice": the number takes calls only.
             if mode != "voice" {
                 ways.push((
-                    format!("Text {number}"),
+                    format!("Отправить SMS на {number}"),
                     TwoFactorCallbackResponse::SendSms(*id),
                 ));
             }
             ways.push((
-                format!("Call {number}"),
+                format!("Позвонить на {number}"),
                 TwoFactorCallbackResponse::CallNumber(*id),
             ));
         }
         ways.push((
-            "Send it to your Apple devices".into(),
+            "Отправить на устройства Apple".into(),
             TwoFactorCallbackResponse::SendToDevices,
         ));
         if self.method != Method::Choose {
             ways.push((
-                "Send the same again".into(),
+                "Отправить ещё раз".into(),
                 TwoFactorCallbackResponse::ResendCode,
             ));
         }
-        ways.push((
-            "Cancel the sign-in".into(),
-            TwoFactorCallbackResponse::Abort,
-        ));
+        ways.push(("Отменить вход".into(), TwoFactorCallbackResponse::Abort));
         ways
     }
 }
 
-/// The code in boxes, and a menu of other ways to get it. None when the
-/// screen can't read keys after all.
 fn ask_two_factor_live(prompt: &Prompt) -> Option<TwoFactorCallbackResponse> {
     let sent = match prompt.method {
-        Method::Devices => Some("sent to your Apple devices".to_string()),
-        Method::Sms => Some(format!("texted to {}", prompt.number(prompt.selected))),
+        Method::Devices => Some("отправлен на ваши устройства Apple".to_string()),
+        Method::Sms => Some(format!(
+            "отправлен по SMS на {}",
+            prompt.number(prompt.selected)
+        )),
         Method::Voice => Some(format!(
-            "Apple is calling {}",
+            "Apple звонит на номер {}",
             prompt.number(prompt.selected)
         )),
         Method::Choose => None,
     };
-    let mut warning = prompt.last_error.as_ref().map(|e| format!("Apple: {e}"));
+    let mut warning = prompt
+        .last_error
+        .as_ref()
+        .map(|e| format!("Ответ Apple: {e}"));
     loop {
         if let Some(sent) = &sent {
             let mut hints = Vec::new();
@@ -888,7 +771,7 @@ fn ask_two_factor_live(prompt: &Prompt) -> Option<TwoFactorCallbackResponse> {
                 hints.push(ui::Hint::Warning(warning));
             }
             hints.push(ui::Hint::Plain(sent.clone()));
-            match ui::ask_code_or_more("enter the code Apple sent", "Code", &hints)? {
+            match ui::ask_code_or_more("введите код от Apple", "Код", &hints)? {
                 ui::CodeAnswer::Code(code) => {
                     return Some(TwoFactorCallbackResponse::SubmitCode(code))
                 }
@@ -898,9 +781,8 @@ fn ask_two_factor_live(prompt: &Prompt) -> Option<TwoFactorCallbackResponse> {
         }
         let ways = prompt.ways();
         let labels: Vec<String> = ways.iter().map(|(label, _)| label.clone()).collect();
-        match ui::choose("how should Apple send the code?", &labels) {
+        match ui::choose("как Apple отправит код?", &labels) {
             Some(i) => return ways.into_iter().nth(i).map(|(_, answer)| answer),
-            // Back to the boxes, when a code is on its way.
             None if sent.is_some() => continue,
             None => return Some(TwoFactorCallbackResponse::Abort),
         }
@@ -910,36 +792,38 @@ fn ask_two_factor_live(prompt: &Prompt) -> Option<TwoFactorCallbackResponse> {
 fn ask_two_factor_plain(prompt: &Prompt) -> TwoFactorCallbackResponse {
     println!();
     if let Some(error) = &prompt.last_error {
-        ui::warn(&format!("Apple: {error}"));
+        ui::warn(&format!("Ответ Apple: {error}"));
     }
     match prompt.method {
-        Method::Devices => {
-            ui::status("Apple sent a verification code to your other Apple devices.")
-        }
+        Method::Devices => ui::status("Apple отправила код проверки на другие ваши устройства."),
         Method::Sms => ui::status(&format!(
-            "Apple texted a verification code to {}.",
+            "Apple отправила код проверки по SMS на {}.",
             prompt.number(prompt.selected)
         )),
         Method::Voice => ui::status(&format!(
-            "Apple is calling {} with a verification code.",
+            "Apple звонит на {} и продиктует код проверки.",
             prompt.number(prompt.selected)
         )),
-        Method::Choose => ui::status("Choose how Apple should send the verification code."),
+        Method::Choose => ui::status("Выберите, как Apple отправит код проверки."),
     }
     for (id, number, mode) in &prompt.numbers {
-        let how = if mode == "voice" { " (calls only)" } else { "" };
+        let how = if mode == "voice" {
+            " (только звонок)"
+        } else {
+            ""
+        };
         ui::status(&format!("  {id}: {number}{how}"));
     }
-    ui::status("Type the code, or: t N to text number N, c N to call it, d for your devices,");
-    ui::status("r to send it again, q to give up.");
+    ui::status("Введите код; t N — SMS на номер N, c N — звонок, d — отправить на устройства,");
+    ui::status("r — отправить ещё раз, q — отменить вход.");
     loop {
-        let Some(line) = ui::ask("Code: ") else {
+        let Some(line) = ui::ask("Код: ") else {
             return TwoFactorCallbackResponse::Abort;
         };
         match parse_two_factor(&line) {
             Some(answer) => return answer,
             None if line.is_empty() => continue,
-            None => ui::warn("That isn't a 6-digit code or one of t N, c N, d, r, q."),
+            None => ui::warn("Введите шестизначный код или одну из команд: t N, c N, d, r, q."),
         }
     }
 }
@@ -970,61 +854,56 @@ fn parse_two_factor(line: &str) -> Option<TwoFactorCallbackResponse> {
     }
 }
 
-/// isideload asks this when the account already has as many development
-/// certificates as Apple allows. Revoking one stops every app signed with it
-/// (on any device) from opening, so nothing is revoked without the user typing
-/// which.
-#[allow(clippy::ptr_arg)] // isideload's `MaxCertsBehavior::Prompt` takes a `&Vec`
+#[allow(clippy::ptr_arg)]
 fn choose_certificates_to_revoke(certs: &Vec<DevelopmentCertificate>) -> Option<Vec<String>> {
     tokio::task::block_in_place(|| {
         if !ui::interactive() {
             return choose_certificates_plain(certs);
         }
         ui::warn(
-            "This Apple Account already has as many signing certificates as Apple allows, so one \
-             must be revoked to make siboot's. Apps signed with a revoked certificate stop \
-             opening, on every device, until they're signed again. This can't be undone.",
+            "У этой учётной записи достигнут лимит сертификатов подписи Apple. Чтобы создать сертификат siboot, нужно отозвать один из существующих. Подписанные им приложения перестанут открываться на всех устройствах, пока их не переподпишут. Отменить отзыв нельзя.",
         );
         let mut labels: Vec<String> = certs
             .iter()
             .map(|cert| {
                 format!(
                     "{} · \"{}\" · {}",
-                    cert.name.as_deref().unwrap_or("certificate"),
+                    cert.name.as_deref().unwrap_or("сертификат"),
                     cert.machine_name.as_deref().unwrap_or("?"),
                     cert.serial_number.as_deref().unwrap_or("?"),
                 )
             })
             .collect();
-        labels.push("None: stop here".into());
-        let index = ui::choose("revoke which certificate?", &labels)?;
+        labels.push("Не отзывать — остановить".into());
+        let index = ui::choose("какой сертификат отозвать?", &labels)?;
         let serial = certs.get(index)?.serial_number.clone()?;
-        if !ui::confirm("revoke it? this can't be undone", false) {
+        if !ui::confirm("отозвать сертификат? это нельзя отменить", false)
+        {
             return None;
         }
-        ui::status(&format!("revoking certificate {serial}"));
+        ui::status(&format!("отзыв сертификата {serial}"));
         Some(vec![serial])
     })
 }
 
 fn choose_certificates_plain(certs: &[DevelopmentCertificate]) -> Option<Vec<String>> {
     println!();
-    ui::warn("This Apple Account already has as many signing certificates as Apple allows,");
-    ui::warn("so one must be revoked to make siboot's. Apps signed with a revoked certificate");
-    ui::warn("stop opening, on every device, until they're signed again. This can't be undone.");
+    ui::warn("Достигнут лимит сертификатов подписи Apple для этой учётной записи.");
+    ui::warn("Чтобы создать сертификат siboot, нужно отозвать существующий.");
+    ui::warn("Приложения с ним перестанут открываться на всех устройствах. Отменить нельзя.");
     for (i, cert) in certs.iter().enumerate() {
         ui::status(&format!(
-            "  {}: {} — made on \"{}\", serial {}",
+            "  {}: {} — создан на «{}», серийный номер {}",
             i + 1,
-            cert.name.as_deref().unwrap_or("certificate"),
+            cert.name.as_deref().unwrap_or("сертификат"),
             cert.machine_name.as_deref().unwrap_or("?"),
             cert.serial_number.as_deref().unwrap_or("?"),
         ));
     }
-    let line = ui::ask("Number to revoke (empty to stop): ")?;
+    let line = ui::ask("Номер сертификата для отзыва (пусто — отмена): ")?;
     let index = line.trim().parse::<usize>().ok()?.checked_sub(1)?;
     let serial = certs.get(index)?.serial_number.clone()?;
-    ui::status(&format!("revoking certificate {serial}"));
+    ui::status(&format!("отзыв сертификата {serial}"));
     Some(vec![serial])
 }
 
@@ -1074,14 +953,11 @@ mod tests {
             candidates(None, None)[..2],
             ["https://anisette.lillq.me", "https://new.ani.sidestore.io"]
         );
-        // lillq's identities work nowhere else: after a macOS server, the
-        // others that take its identity (and its saved token) come first.
         let after_mac = candidates(None, Some("https://new.ani.sidestore.io"));
         let lillq = after_mac.iter().position(|s| s == POOL).unwrap();
         assert_eq!(lillq, SERVERS.len() - 2, "{after_mac:?}");
         assert_eq!(after_mac.last().unwrap(), WINDOWS_SERVER);
         assert_eq!(after_mac.len(), SERVERS.len());
-        // After lillq or the Windows server, lillq's next in line anyway.
         assert_eq!(candidates(None, Some(POOL)), SERVERS);
         assert_eq!(candidates(None, Some(WINDOWS_SERVER))[1], POOL);
         assert_eq!(
@@ -1117,7 +993,6 @@ mod tests {
         assert!(!old.exists());
         assert_eq!(std::fs::read_to_string(new.join("key")).unwrap(), "old key");
 
-        // A lowercase folder already there is never replaced.
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("key"), "other key").unwrap();
         adopt_folder_typed_as(&storage, typed, &apple_id);
@@ -1135,8 +1010,6 @@ mod tests {
         dir
     }
 
-    /// A token as apple_session.rs's `SavedSession` serializes, in the
-    /// account's folder.
     fn save_token(storage: &Path, apple_id: &str, expiry: u64, duration: u64, saved_at: u64) {
         let dir = apple_session::account_dir(storage, apple_id);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1152,7 +1025,6 @@ mod tests {
         let id = "someone@example.com";
         assert!(matches!(saved_token(&storage, id, NOW), Saved::None));
 
-        // Apple's expiry in milliseconds, a day off.
         save_token(&storage, id, (NOW + 86_400) * 1000, 0, NOW - 100);
         let Saved::Usable(token) = saved_token(&storage, id, NOW) else {
             panic!("a day left is usable");
@@ -1161,17 +1033,14 @@ mod tests {
         assert_eq!(token.app_token().token, "AAAABLwIAAAAAGW");
         assert_eq!(token.lifetime(NOW), "Apple's sign-in lasts 1d 0h more");
 
-        // Within ten minutes of the expiry, or past it: the password.
         save_token(&storage, id, NOW + 300, 0, NOW - 100);
         assert!(matches!(saved_token(&storage, id, NOW), Saved::RunOut));
         save_token(&storage, id, 0, 3_600, NOW - 7_200);
         assert!(matches!(saved_token(&storage, id, NOW), Saved::RunOut));
 
-        // No expiry and no duration: tried anyway, as apple_session.rs does.
         save_token(&storage, id, 0, 0, NOW - 100);
         assert!(matches!(saved_token(&storage, id, NOW), Saved::Usable(_)));
 
-        // One naming another account, or one that can't be read: none.
         save_token(&storage, id, 0, 0, NOW);
         let dir = apple_session::account_dir(&storage, id);
         let other = std::fs::read_to_string(dir.join(SESSION_FILE))
@@ -1185,8 +1054,6 @@ mod tests {
         std::fs::remove_dir_all(&storage).unwrap();
     }
 
-    /// siboot reads the token where apple_session.rs keeps it: its own
-    /// `forget` takes away the file siboot reads.
     #[test]
     fn the_token_is_read_where_apple_session_keeps_it() {
         let storage = store("path");
@@ -1204,14 +1071,12 @@ mod tests {
         let home = storage.join("home");
         save_token(&storage, "old@example.com", 0, 0, NOW - 1_000);
         save_token(&storage, "new@example.com", 0, 0, NOW);
-        // A token in a folder that isn't its account's is left out.
         save_token(&storage, "moved@example.com", 0, 0, NOW + 1);
         std::fs::rename(
             apple_session::account_dir(&storage, "moved@example.com"),
             storage.join("elsewhere"),
         )
         .unwrap();
-        // So is a folder with no token, like the anisette identity's.
         std::fs::create_dir_all(storage.join("anisette")).unwrap();
 
         assert_eq!(
@@ -1221,7 +1086,6 @@ mod tests {
         start_list(&home, &storage);
         assert_eq!(saved::list(&home), ["new@example.com", "old@example.com"]);
 
-        // Only the first time: one forgotten since doesn't come back.
         saved::forget(&home, "old@example.com").unwrap();
         start_list(&home, &storage);
         assert_eq!(saved::list(&home), ["new@example.com"]);
@@ -1259,9 +1123,6 @@ mod tests {
         }
     }
 
-    /// The certificate prompt blocks in place, and isideload calls it from the
-    /// pipeline, which `main` runs with `Runtime::block_on` on a two-worker
-    /// runtime, not on a worker. That combination has to be allowed.
     #[test]
     fn the_revoke_prompt_may_block_where_the_pipeline_runs() {
         let runtime = tokio::runtime::Builder::new_multi_thread()

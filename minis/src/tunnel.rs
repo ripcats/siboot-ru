@@ -1,14 +1,3 @@
-//! Step 3: the tunnel, opened the way SideInstaller opens it
-//! (`tunnel_create_rppairing_multihost` in ../SideInstaller/rust-core/vendor/idevice-ffi):
-//!
-//! ```text
-//! 10.7.0.1:49152 (RPPairing) → pair-verify → createListener
-//!   → TLS-PSK → CDTunnel → software TCP stack → RSD → services
-//! ```
-//!
-//! LocalDevVPN sends 10.7.0.1 back to this iPhone, and the iPhone opens the
-//! tunnel listener on the same address, so there is one host to dial.
-
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
@@ -27,10 +16,8 @@ use tokio::time::timeout;
 use crate::fail::{chain, Fail, Result};
 use crate::ui;
 
-/// The name this host gives in its messages to the device.
 const HOSTNAME: &str = "siboot";
 
-/// A tunnel with its RSD handshake: what every service connects through.
 pub struct Connection {
     pub adapter: AdapterHandle,
     pub handshake: RsdHandshake,
@@ -43,26 +30,23 @@ pub struct DeviceInfo {
     pub udid: String,
 }
 
-/// Pair-verify with the file at `path`, and nothing more: does this iPhone
-/// still trust it?
 pub async fn verify(addr: SocketAddr, path: &Path) -> Result<()> {
     let mut file = read_pairing(path).await?;
     pair_verified(addr, &mut file).await.map(|_| ())
 }
 
-/// The whole tunnel.
 pub async fn open(addr: SocketAddr, path: &Path) -> Result<Connection> {
     let mut file = read_pairing(path).await?;
     let mut rpc = pair_verified(addr, &mut file).await?;
 
     let port = step(
-        "asking the iPhone for a tunnel listener",
+        "запрос туннельного порта у iPhone",
         15,
         rpc.create_tcp_listener(),
     )
     .await?;
-    ui::detail(&format!("tunnel listener on port {port}"));
-    ui::activity("connecting to the tunnel listener");
+    ui::detail(&format!("туннельный порт: {port}"));
+    ui::activity("подключение к туннельному порту");
     let stream = match timeout(
         Duration::from_secs(10),
         TcpStream::connect((addr.ip(), port)),
@@ -73,7 +57,7 @@ pub async fn open(addr: SocketAddr, path: &Path) -> Result<Connection> {
         Ok(Err(e)) => {
             return Err(Fail::new(
                 format!(
-                    "The iPhone opened a tunnel port but {}:{port} can't be reached.",
+                    "iPhone открыл туннельный порт, но подключиться к {}:{port} не удалось.",
                     addr.ip()
                 ),
                 e.to_string(),
@@ -82,59 +66,59 @@ pub async fn open(addr: SocketAddr, path: &Path) -> Result<Connection> {
         Err(_) => {
             return Err(Fail::new(
                 format!(
-                    "The iPhone opened a tunnel port but {}:{port} didn't answer.",
+                    "iPhone открыл туннельный порт, но {}:{port} не отвечает.",
                     addr.ip()
                 ),
-                "connect timed out",
+                "истекло время ожидания подключения",
             ))
         }
     };
     let tunnel = step(
-        "starting the encrypted tunnel",
+        "запуск защищённого туннеля",
         20,
         connect_tls_psk_tunnel_native(stream, rpc.encryption_key()),
     )
     .await?;
     let client_ip: IpAddr = tunnel.info.client_address.parse().map_err(|e| {
         Fail::new(
-            "The tunnel reported an address siboot can't read.",
+            "Туннель вернул адрес в неизвестном формате.",
             format!("{e}"),
         )
     })?;
     let server_ip: IpAddr = tunnel.info.server_address.parse().map_err(|e| {
         Fail::new(
-            "The tunnel reported an address siboot can't read.",
+            "Туннель вернул адрес в неизвестном формате.",
             format!("{e}"),
         )
     })?;
     let mtu = tunnel.info.mtu as usize;
     let rsd_port = tunnel.info.server_rsd_port;
     ui::detail(&format!(
-        "tunnel up: {client_ip} → {server_ip}, MTU {mtu}, RSD on {rsd_port}"
+        "туннель открыт: {client_ip} → {server_ip}, MTU {mtu}, RSD на порту {rsd_port}"
     ));
 
     let mut adapter = Adapter::new(Box::new(tunnel.into_inner()), client_ip, server_ip);
     adapter.set_mss(mtu.saturating_sub(60));
     let mut adapter = adapter.to_async_handle();
-    ui::activity("reaching RSD inside the tunnel");
+    ui::activity("подключение к RSD через туннель");
     let rsd = match timeout(Duration::from_secs(15), adapter.connect(rsd_port)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             return Err(Fail::new(
-                "The tunnel came up, but RSD inside it didn't answer.",
+                "Туннель открыт, но RSD не отвечает.",
                 e.to_string(),
             ))
         }
         Err(_) => {
             return Err(Fail::new(
-                "The tunnel came up, but RSD inside it didn't answer.",
-                "timed out",
+                "Туннель открыт, но RSD не отвечает.",
+                "истекло время ожидания",
             ))
         }
     };
-    let handshake = step("reading the iPhone's services", 15, RsdHandshake::new(rsd)).await?;
+    let handshake = step("получение списка служб iPhone", 15, RsdHandshake::new(rsd)).await?;
     ui::detail(&format!(
-        "RSD: {} services, protocol {}",
+        "RSD: служб — {}, версия протокола — {}",
         handshake.services.len(),
         handshake.protocol_version
     ));
@@ -142,16 +126,15 @@ pub async fn open(addr: SocketAddr, path: &Path) -> Result<Connection> {
 }
 
 impl Connection {
-    /// Name, model, iOS version and UDID, from lockdownd inside the tunnel.
     pub async fn describe(&mut self) -> Result<DeviceInfo> {
         let mut lockdown = step(
-            "asking lockdownd about this iPhone",
+            "запрос сведений об iPhone у lockdownd",
             15,
             LockdownClient::connect_rsd(&mut self.adapter, &mut self.handshake),
         )
         .await?;
         let values = step(
-            "asking lockdownd about this iPhone",
+            "запрос сведений об iPhone у lockdownd",
             15,
             lockdown.get_value(None, None),
         )
@@ -163,7 +146,6 @@ impl Connection {
                 .and_then(|v| v.as_string())
                 .map(str::to_string)
         };
-        // RSD's own properties carry the UDID too, if lockdownd leaves it out.
         let udid = field("UniqueDeviceID").or_else(|| {
             self.handshake
                 .properties
@@ -173,7 +155,7 @@ impl Connection {
         });
         let udid = udid.ok_or_else(|| {
             Fail::new(
-                "This iPhone didn't say its UDID, which signing needs.",
+                "iPhone не сообщил UDID, необходимый для подписи.",
                 "no UniqueDeviceID from lockdownd or RSD",
             )
         })?;
@@ -190,7 +172,7 @@ async fn read_pairing(path: &Path) -> Result<RpPairingFile> {
     RpPairingFile::read_from_file(path).await.map_err(|e| {
         Fail::new(
             format!(
-                "Couldn't read the pairing file at {}. Pair again in rootshell (`./siboot-pair.wasm`), then run siboot again.",
+                "Не удалось прочитать файл сопряжения {}. Выполните сопряжение через rootshell (`./siboot-pair.wasm`), затем снова запустите siboot.",
                 path.display()
             ),
             chain(&e),
@@ -198,9 +180,6 @@ async fn read_pairing(path: &Path) -> Result<RpPairingFile> {
     })
 }
 
-/// Connect to the RPPairing listener and pair-verify, without the fallback to
-/// pair-setup that `RemotePairingClient::connect` takes: the device refuses a
-/// computer-initiated pair-setup, so it would only hang up.
 async fn pair_verified(
     addr: SocketAddr,
     file: &mut RpPairingFile,
@@ -209,36 +188,33 @@ async fn pair_verified(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(Fail::new(
             format!(
-                "Couldn't reach this iPhone at {addr}. Connect LocalDevVPN, and check Wi-Fi is on."
+                "Не удалось подключиться к iPhone по адресу {addr}. Подключите LocalDevVPN и проверьте Wi-Fi."
             ),
             e.to_string(),
         )),
         Err(_) => {
             return Err(Fail::new(
-                format!("Nothing answered at {addr}. Connect LocalDevVPN, and check Wi-Fi is on."),
-                "connect timed out",
+                format!("По адресу {addr} нет ответа. Подключите LocalDevVPN и проверьте Wi-Fi."),
+                "истекло время ожидания подключения",
             ))
         }
     };
     let mut rpc = RemotePairingClient::new(RpPairingSocket::new(stream), HOSTNAME);
-    step("greeting the iPhone", 10, rpc.attempt_pair_verify()).await?;
-    ui::activity("checking the pairing with it");
+    step("установление связи с iPhone", 10, rpc.attempt_pair_verify()).await?;
+    ui::activity("проверка файла сопряжения");
     match timeout(Duration::from_secs(15), rpc.validate_pairing(file)).await {
         Ok(Ok(())) => Ok(rpc),
         Ok(Err(e)) => Err(Fail::new(
-            "This iPhone doesn't accept the pairing file (it was removed in Settings, or the \
-             iPhone was reset). Pair again in rootshell (`./siboot-pair.wasm`), then run siboot again.",
+            "iPhone не принимает файл сопряжения: возможно, он удалён в Настройках или iPhone сброшен. Выполните сопряжение через rootshell (`./siboot-pair.wasm`), затем снова запустите siboot.",
             chain(&e),
         )),
         Err(_) => Err(Fail::new(
-            "The iPhone stopped answering while checking the pairing.",
-            "pair-verify timed out",
+            "iPhone перестал отвечать во время проверки сопряжения.",
+            "истекло время ожидания проверки сопряжения",
         )),
     }
 }
 
-/// Await `future` for up to `secs`, showing `what` on the live screen while
-/// it runs, and naming it if it fails or runs out.
 pub async fn step<T, E: std::error::Error>(
     what: &str,
     secs: u64,
@@ -247,10 +223,13 @@ pub async fn step<T, E: std::error::Error>(
     ui::activity(what);
     match timeout(Duration::from_secs(secs), future).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(Fail::new(format!("Failed while {what}."), chain(&e))),
+        Ok(Err(e)) => Err(Fail::new(
+            format!("Ошибка во время операции: {what}."),
+            chain(&e),
+        )),
         Err(_) => Err(Fail::new(
-            format!("Timed out while {what}."),
-            format!("no answer within {secs} s"),
+            format!("Истекло время ожидания операции: {what}."),
+            format!("нет ответа за {secs} с"),
         )),
     }
 }

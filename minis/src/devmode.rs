@@ -1,15 +1,3 @@
-//! `siboot developer-mode`: shows Developer Mode under Settings › Privacy &
-//! Security, or turns it on, as SideInstaller's Settings › Developer Mode does
-//! (`Engine.requestDeveloperMode` in ../SideInstaller/ios-app): inside the tunnel, lockdownd
-//! says whether it's on (`DeveloperModeStatus` in `com.apple.security.mac.amfi`),
-//! and AMFI's RSD shim (`com.apple.amfi.lockdown.shim.remote`) takes the
-//! request, action 0 to show the switch or 1 to turn it on.
-//!
-//! It goes through the same pairing and tunnel as the install, so it can only
-//! help while the iPhone still answers on its pairing port with that pairing.
-//! It never sends anything when Developer Mode is already on: turning it on
-//! restarts the iPhone.
-
 use std::time::Duration;
 
 use idevice::amfi::AmfiClient;
@@ -23,36 +11,23 @@ use crate::ui;
 
 const AMFI_DOMAIN: &str = "com.apple.security.mac.amfi";
 const STATUS_KEY: &str = "DeveloperModeStatus";
-/// How long AMFI may take to answer a request. Turning Developer Mode on can
-/// restart the iPhone before the answer comes.
 const REPLY_WAIT: Duration = Duration::from_secs(20);
 
-/// What the user asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
-    /// Show the Developer Mode switch in Settings.
     Show,
-    /// Turn Developer Mode on: the iPhone restarts, then asks to confirm.
     TurnOn,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// It was on already, so nothing was sent.
     AlreadyOn,
-    /// The switch now shows in Settings.
     Shown,
-    /// AMFI took the request, and the iPhone restarts.
     TurningOn,
-    /// The iPhone hung up right after the request, as it does when it
-    /// restarts before answering.
     HungUp,
-    /// iOS refused to turn it on because of the passcode, so the switch was
-    /// shown in Settings instead.
     ShownForPasscode,
 }
 
-/// The services a request goes to: the tunnel's, or stand-ins in the tests.
 pub trait Services {
     async fn lockdown(&mut self) -> std::result::Result<LockdownClient, IdeviceError>;
     async fn amfi(&mut self) -> std::result::Result<AmfiClient, IdeviceError>;
@@ -68,23 +43,19 @@ impl Services for Connection {
     }
 }
 
-/// Added to a failure before the request: what's left when siboot can't reach
-/// the iPhone.
 pub fn unreachable_note(f: Fail) -> Fail {
     let mut advice = format!(
-        "{} siboot changes Developer Mode through this same pairing and tunnel, so it can't \
-         until they work.",
+        "{} siboot меняет режим разработчика через это сопряжение и туннель, поэтому они должны работать.",
         f.advice
     );
-    // The probe's own advice already says where the switch is.
-    if !f.advice.contains("Developer Mode") {
-        advice.push_str(" If Developer Mode is under Settings › Privacy & Security, turn it on there instead.");
+    if !f.advice.contains("режим разработчика") {
+        advice.push_str(
+            " Включите режим разработчика в разделе Настройки › Конфиденциальность и безопасность.",
+        );
     }
     Fail { advice, ..f }
 }
 
-/// Ask for `request`. `confirm` is asked before anything that restarts the
-/// iPhone, and nothing is sent unless it says yes.
 pub async fn run(
     device: &mut impl Services,
     request: Request,
@@ -93,14 +64,14 @@ pub async fn run(
     let on = match read_status(device).await {
         Ok(on) => on,
         Err(f) => {
-            ui::warn("Couldn't read whether Developer Mode is on, so siboot asks anyway.");
+            ui::warn("Не удалось проверить, включён ли режим разработчика; siboot всё равно отправит запрос.");
             ui::detail(&f.raw);
             None
         }
     };
     match on {
         Some(true) => return Ok(Outcome::AlreadyOn),
-        Some(false) => ui::status("Developer Mode is off"),
+        Some(false) => ui::status("Режим разработчика выключен"),
         None => {}
     }
 
@@ -108,27 +79,23 @@ pub async fn run(
         return match send(device, Action::Show).await? {
             Sent::Done => Ok(Outcome::Shown),
             Sent::HungUp(raw) => Err(Fail::new(
-                "The iPhone stopped answering before it said whether it shows Developer Mode. \
-                 Look under Settings › Privacy & Security; if it isn't there, run siboot \
-                 developer-mode again.",
+                "iPhone перестал отвечать до подтверждения запроса. Проверьте раздел Настройки › Конфиденциальность и безопасность; если переключателя нет, снова запустите siboot developer-mode.",
                 raw,
             )),
             Sent::Refused(raw) => Err(Fail::new(
-                "This iPhone refused to show Developer Mode in Settings.",
+                "iPhone отказался показать режим разработчика в Настройках.",
                 raw,
             )),
         };
     }
 
     ui::warn(
-        "Without a passcode, this iPhone restarts right away to turn Developer Mode on, and Minis \
-         stops with it. Once you unlock it, tap Turn On in the alert iOS shows.",
+        "Без код-пароля iPhone сразу перезагрузится для включения режима разработчика, а Minis остановится. После разблокировки нажмите «Включить» в уведомлении iOS.",
     );
-    ui::note("With a passcode, iOS refuses, and siboot shows the switch in Settings instead.");
+    ui::note("Если установлен код-пароль, iOS откажет, и siboot вместо этого покажет переключатель в Настройках.");
     if !confirm() {
         return Err(Fail::new(
-            "Nothing was sent, so Developer Mode stays off. `siboot developer-mode` without \
-             --turn-on only shows it in Settings, and restarts nothing.",
+            "Запрос не отправлен, режим разработчика остался выключен. Команда `siboot developer-mode` без --turn-on только показывает переключатель и не перезагружает iPhone.",
             "",
         ));
     }
@@ -138,33 +105,28 @@ pub async fn run(
             ui::detail(&raw);
             Ok(Outcome::HungUp)
         }
-        // AMFI answers {Error: "Device has a passcode set"}.
         Sent::Refused(raw) if raw.to_lowercase().contains("passcode") => {
-            ui::note("iOS turns it on from here only while the iPhone has no passcode.");
+            ui::note("iOS позволяет включить режим таким способом только без код-пароля.");
             ui::detail(&raw);
             match send(device, Action::Show).await? {
                 Sent::Done => Ok(Outcome::ShownForPasscode),
                 Sent::HungUp(raw) | Sent::Refused(raw) => Err(Fail::new(
-                    "iOS turns Developer Mode on from here only while the iPhone has no passcode, \
-                     and it didn't take the request to show it in Settings either. Run siboot \
-                     developer-mode (without --turn-on) again.",
+                    "iOS позволяет включить режим таким способом только без код-пароля и не смогла показать переключатель. Снова запустите siboot developer-mode без --turn-on.",
                     raw,
                 )),
             }
         }
         Sent::Refused(raw) => Err(Fail::new(
-            "This iPhone refused to turn Developer Mode on.",
+            "iPhone отказался включить режим разработчика.",
             raw,
         )),
     }
 }
 
-/// Whether Developer Mode is on, as lockdownd says (as pymobiledevice3 reads
-/// it). None when the answer isn't a yes or no.
 async fn read_status(device: &mut impl Services) -> Result<Option<bool>> {
-    let mut lockdown = tunnel::step("connecting to lockdownd", 15, device.lockdown()).await?;
+    let mut lockdown = tunnel::step("подключение к lockdownd", 15, device.lockdown()).await?;
     let value = tunnel::step(
-        "asking whether Developer Mode is on",
+        "проверка режима разработчика",
         15,
         lockdown.get_value(Some(STATUS_KEY), Some(AMFI_DOMAIN)),
     )
@@ -178,24 +140,20 @@ enum Action {
     TurnOn,
 }
 
-/// What became of one AMFI request.
 enum Sent {
     Done,
-    /// The connection closed, or went quiet, after the request.
     HungUp(String),
-    /// The iPhone answered with an error.
     Refused(String),
 }
 
-/// Send `action` on a fresh AMFI connection: iOS closes it after one request.
 async fn send(device: &mut impl Services, action: Action) -> Result<Sent> {
-    let mut amfi = tunnel::step("connecting to AMFI on the iPhone", 15, device.amfi()).await?;
+    let mut amfi = tunnel::step("подключение к AMFI на iPhone", 15, device.amfi()).await?;
     let answered = match action {
         Action::Show => timeout(REPLY_WAIT, amfi.reveal_developer_mode_option_in_ui()).await,
         Action::TurnOn => timeout(REPLY_WAIT, amfi.enable_developer_mode()).await,
     };
     Ok(match answered {
-        Err(_) => Sent::HungUp(format!("no answer within {} s", REPLY_WAIT.as_secs())),
+        Err(_) => Sent::HungUp(format!("нет ответа за {} с", REPLY_WAIT.as_secs())),
         Ok(Ok(())) => Sent::Done,
         Ok(Err(IdeviceError::Socket(e))) => Sent::HungUp(e.to_string()),
         Ok(Err(e)) => Sent::Refused(chain(&e)),
@@ -209,7 +167,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-    /// How a stand-in AMFI answers one request.
     #[derive(Clone, Copy)]
     enum Answer {
         Success,
@@ -218,9 +175,6 @@ mod tests {
         HangUp,
     }
 
-    /// A stand-in iPhone: lockdownd answers the status read with `status`
-    /// (or an error when None), and each AMFI connection answers its one
-    /// request with the next of `answers`. Records the actions it was sent.
     struct FakeIphone {
         status: Option<plist::Value>,
         answers: Vec<Answer>,
@@ -253,13 +207,21 @@ mod tests {
 
     async fn write_message(stream: &mut DuplexStream, message: plist::Dictionary) {
         let mut body = Vec::new();
-        plist::Value::Dictionary(message).to_writer_xml(&mut body).unwrap();
-        stream.write_all(&(body.len() as u32).to_be_bytes()).await.unwrap();
+        plist::Value::Dictionary(message)
+            .to_writer_xml(&mut body)
+            .unwrap();
+        stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
         stream.write_all(&body).await.unwrap();
     }
 
     fn dict(pairs: &[(&str, plist::Value)]) -> plist::Dictionary {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     impl Services for FakeIphone {
@@ -268,12 +230,23 @@ mod tests {
             let status = self.status.clone();
             let asked = self.lockdown_asked.clone();
             tokio::spawn(async move {
-                let Some(request) = read_message(&mut theirs).await else { return };
-                let field = |k: &str| request.get(k).and_then(|v| v.as_string()).unwrap_or("").to_string();
+                let Some(request) = read_message(&mut theirs).await else {
+                    return;
+                };
+                let field = |k: &str| {
+                    request
+                        .get(k)
+                        .and_then(|v| v.as_string())
+                        .unwrap_or("")
+                        .to_string()
+                };
                 asked.lock().unwrap().push((field("Key"), field("Domain")));
                 let reply = match status {
                     Some(value) => dict(&[("Request", "GetValue".into()), ("Value", value)]),
-                    None => dict(&[("Request", "GetValue".into()), ("Error", "MissingValue".into())]),
+                    None => dict(&[
+                        ("Request", "GetValue".into()),
+                        ("Error", "MissingValue".into()),
+                    ]),
                 };
                 write_message(&mut theirs, reply).await;
             });
@@ -281,12 +254,20 @@ mod tests {
         }
 
         async fn amfi(&mut self) -> std::result::Result<AmfiClient, IdeviceError> {
-            let answer = self.answers.pop().expect("siboot opened more AMFI connections than expected");
+            let answer = self
+                .answers
+                .pop()
+                .expect("siboot opened more AMFI connections than expected");
             let (ours, mut theirs) = tokio::io::duplex(64 * 1024);
             let sent = self.sent.clone();
             tokio::spawn(async move {
-                let Some(request) = read_message(&mut theirs).await else { return };
-                let action = request.get("action").and_then(|v| v.as_signed_integer()).unwrap_or(-1);
+                let Some(request) = read_message(&mut theirs).await else {
+                    return;
+                };
+                let action = request
+                    .get("action")
+                    .and_then(|v| v.as_signed_integer())
+                    .unwrap_or(-1);
                 sent.lock().unwrap().push(action);
                 let reply = match answer {
                     Answer::Success => dict(&[("success", true.into())]),
@@ -329,20 +310,27 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_status_still_sends_the_request() {
         let mut iphone = FakeIphone::new(None, &[Answer::Success]);
-        assert_eq!(run(&mut iphone, Request::Show, never_asked).await.unwrap(), Outcome::Shown);
+        assert_eq!(
+            run(&mut iphone, Request::Show, never_asked).await.unwrap(),
+            Outcome::Shown
+        );
         assert_eq!(iphone.sent(), [0]);
 
-        // Not a yes or no: unknown, too.
         let mut iphone = FakeIphone::new(Some("maybe".into()), &[Answer::Success]);
-        assert_eq!(run(&mut iphone, Request::Show, never_asked).await.unwrap(), Outcome::Shown);
+        assert_eq!(
+            run(&mut iphone, Request::Show, never_asked).await.unwrap(),
+            Outcome::Shown
+        );
         assert_eq!(iphone.sent(), [0]);
     }
 
     #[tokio::test]
     async fn turning_on_needs_a_yes() {
         let mut iphone = FakeIphone::new(Some(false.into()), &[]);
-        let f = run(&mut iphone, Request::TurnOn, || false).await.unwrap_err();
-        assert!(f.advice.contains("Nothing was sent"), "{}", f.advice);
+        let f = run(&mut iphone, Request::TurnOn, || false)
+            .await
+            .unwrap_err();
+        assert!(f.advice.contains("Запрос не отправлен"), "{}", f.advice);
         assert!(iphone.sent().is_empty());
 
         let mut iphone = FakeIphone::new(Some(false.into()), &[Answer::Success]);
@@ -370,29 +358,50 @@ mod tests {
     #[tokio::test]
     async fn other_refusals_stop_with_what_the_iphone_said() {
         let mut iphone = FakeIphone::new(Some(false.into()), &[Answer::OtherError]);
-        let f = run(&mut iphone, Request::TurnOn, || true).await.unwrap_err();
-        assert!(f.advice.contains("refused to turn Developer Mode on"), "{}", f.advice);
+        let f = run(&mut iphone, Request::TurnOn, || true)
+            .await
+            .unwrap_err();
+        assert!(
+            f.advice.contains("отказался включить режим разработчика"),
+            "{}",
+            f.advice
+        );
         assert!(f.raw.contains("Something else"), "{}", f.raw);
         assert_eq!(iphone.sent(), [1]);
 
         let mut iphone = FakeIphone::new(Some(false.into()), &[Answer::OtherError]);
-        let f = run(&mut iphone, Request::Show, never_asked).await.unwrap_err();
-        assert!(f.advice.contains("refused to show Developer Mode"), "{}", f.advice);
+        let f = run(&mut iphone, Request::Show, never_asked)
+            .await
+            .unwrap_err();
+        assert!(
+            f.advice.contains("отказался показать режим разработчика"),
+            "{}",
+            f.advice
+        );
 
         let mut iphone = FakeIphone::new(Some(false.into()), &[Answer::HangUp]);
-        let f = run(&mut iphone, Request::Show, never_asked).await.unwrap_err();
-        assert!(f.advice.contains("stopped answering"), "{}", f.advice);
+        let f = run(&mut iphone, Request::Show, never_asked)
+            .await
+            .unwrap_err();
+        assert!(f.advice.contains("перестал отвечать"), "{}", f.advice);
     }
 
     #[test]
     fn the_note_keeps_the_original_advice_and_cause() {
-        let f = unreachable_note(Fail::new("Couldn't reach 10.7.0.1:49152.", "refused"));
-        assert!(f.advice.starts_with("Couldn't reach 10.7.0.1:49152. siboot changes"));
-        assert!(f.advice.ends_with("turn it on there instead."), "{}", f.advice);
+        let f = unreachable_note(Fail::new(
+            "Не удалось подключиться к 10.7.0.1:49152.",
+            "refused",
+        ));
+        assert!(f
+            .advice
+            .starts_with("Не удалось подключиться к 10.7.0.1:49152. siboot изменяет"));
+        assert!(f.advice.ends_with("включите его там."), "{}", f.advice);
         assert_eq!(f.raw, "refused");
 
-        // Said once, where the advice already names the switch.
-        let f = unreachable_note(Fail::new("Turn on Developer Mode (Settings › …).", ""));
+        let f = unreachable_note(Fail::new(
+            "Включите режим разработчика (Настройки › …).",
+            "",
+        ));
         assert_eq!(f.advice.matches("Settings ›").count(), 1, "{}", f.advice);
     }
 }

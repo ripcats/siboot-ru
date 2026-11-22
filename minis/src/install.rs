@@ -1,10 +1,3 @@
-//! Step 6: upload the signed app to /PublicStaging over AFC and install it with
-//! installation_proxy, as `DeviceConnection.installSignedApp` does.
-//!
-//! The upload is checked file by file before installing: installd accepts a
-//! bundle with a sealed file missing and installs it without a word, and the
-//! app then fails to open.
-
 use std::path::{Path, PathBuf};
 
 use idevice::afc::opcode::AfcFopenMode;
@@ -17,8 +10,8 @@ use crate::tunnel::Connection;
 use crate::ui;
 
 const STAGING: &str = "/PublicStaging";
+const UPLOAD_CHUNK: usize = 1024 * 1024;
 
-/// One file or folder of the bundle, relative to its root.
 #[derive(Debug, PartialEq)]
 pub struct Entry {
     pub relative: String,
@@ -26,41 +19,39 @@ pub struct Entry {
     pub size: u64,
 }
 
-/// Returns what went up, as "51.0 MB, 412 files".
 pub async fn install(connection: &mut Connection, app_dir: &Path) -> Result<String> {
     let bundle_name = app_dir
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| {
             Fail::new(
-                "The signed app has no folder name.",
+                "У подписанного приложения нет имени каталога.",
                 app_dir.display().to_string(),
             )
         })?;
     let remote_root = format!("{STAGING}/{bundle_name}");
     let entries = bundle_entries(app_dir).map_err(|e| {
         Fail::new(
-            format!("Couldn't read {}.", app_dir.display()),
+            format!("Не удалось прочитать {}.", app_dir.display()),
             e.to_string(),
         )
     })?;
     let total: u64 = entries.iter().map(|e| e.size).sum();
     let files = entries.iter().filter(|e| !e.is_dir).count();
-    let size = format!("{:.1} MB, {files} files", total as f64 / 1_048_576.0);
+    let size = format!("{:.1} МБ, файлов: {files}", total as f64 / 1_048_576.0);
     ui::status(&format!(
-        "uploading {files} files ({:.1} MB)",
+        "загрузка файлов: {files} ({:.1} МБ)",
         total as f64 / 1_048_576.0
     ));
 
     let mut afc = AfcClient::connect_rsd(&mut connection.adapter, &mut connection.handshake)
         .await
-        .map_err(|e| Fail::new("Couldn't open AFC on this iPhone.", chain(&e)))?;
-    // Left from an earlier run, it would mix old files into this upload.
+        .map_err(|e| Fail::new("Не удалось открыть AFC на iPhone.", chain(&e)))?;
     let _ = afc.remove_all(remote_root.clone()).await;
     let _ = afc.mk_dir(STAGING).await;
     afc.mk_dir(remote_root.clone()).await.map_err(|e| {
         Fail::new(
-            format!("Couldn't create {remote_root} on this iPhone."),
+            format!("Не удалось создать {remote_root} на iPhone."),
             chain(&e),
         )
     })?;
@@ -72,44 +63,44 @@ pub async fn install(connection: &mut Connection, app_dir: &Path) -> Result<Stri
         if entry.is_dir {
             afc.mk_dir(remote.clone())
                 .await
-                .map_err(|e| Fail::new(format!("Couldn't create {remote}."), chain(&e)))?;
+                .map_err(|e| Fail::new(format!("Не удалось создать {remote}."), chain(&e)))?;
             continue;
         }
-        let bytes = std::fs::read(app_dir.join(&entry.relative))
-            .map_err(|e| Fail::new(format!("Couldn't read {}.", entry.relative), e.to_string()))?;
+        let bytes = std::fs::read(app_dir.join(&entry.relative)).map_err(|e| {
+            Fail::new(
+                format!("Не удалось прочитать {}.", entry.relative),
+                e.to_string(),
+            )
+        })?;
         let mut file = afc
             .open(remote.clone(), AfcFopenMode::WrOnly)
             .await
-            .map_err(|e| {
+            .map_err(|e| Fail::new(format!("Не удалось создать {remote} на iPhone."), chain(&e)))?;
+        for piece in bytes.chunks(UPLOAD_CHUNK) {
+            file.write_entire(piece).await.map_err(|e| {
                 Fail::new(
-                    format!("Couldn't create {remote} on this iPhone."),
+                    format!("Передача файла {} прервалась.", entry.relative),
                     chain(&e),
                 )
             })?;
-        file.write_entire(&bytes).await.map_err(|e| {
-            Fail::new(
-                format!("The upload of {} broke off.", entry.relative),
-                chain(&e),
-            )
-        })?;
+            sent += piece.len() as u64;
+            ui::progress("передано", sent, total);
+        }
         file.close().await.map_err(|e| {
             Fail::new(
-                format!("The upload of {} broke off.", entry.relative),
+                format!("Передача файла {} прервалась.", entry.relative),
                 chain(&e),
             )
         })?;
-        sent += entry.size;
-        ui::progress("uploaded", sent, total);
     }
-    ui::progress("uploaded", total, total);
+    ui::progress("передано", total, total);
     ui::progress_end();
     ui::detail(&format!(
-        "upload took {:.1} s",
+        "время загрузки: {:.1} с",
         started.elapsed().as_secs_f64()
     ));
 
-    // Every file, at its size: an incomplete bundle installs "fine".
-    ui::status("checking every file arrived whole");
+    ui::status("проверка целостности загруженных файлов");
     let mut missing = Vec::new();
     for entry in entries.iter().filter(|e| !e.is_dir) {
         let remote = format!("{remote_root}/{}", entry.relative);
@@ -125,34 +116,32 @@ pub async fn install(connection: &mut Connection, app_dir: &Path) -> Result<Stri
     if !missing.is_empty() {
         return Err(Fail::new(
             format!(
-                "{} files didn't arrive whole on the iPhone. Run siboot again.",
+                "Файлы не полностью переданы на iPhone (количество: {}). Запустите siboot снова.",
                 missing.len()
             ),
             missing.join(", "),
         ));
     }
-    ui::ok("upload checked: every file arrived whole");
+    ui::ok("проверка загрузки завершена: все файлы переданы полностью");
 
     let mut proxy =
         InstallationProxyClient::connect_rsd(&mut connection.adapter, &mut connection.handshake)
             .await
             .map_err(|e| {
                 Fail::new(
-                    "Couldn't reach installation_proxy on this iPhone.",
+                    "Не удалось подключиться к installation_proxy на iPhone.",
                     chain(&e),
                 )
             })?;
-    // Without PackageType Developer, installd never reads the embedded profile
-    // and rejects the bundle with 0xe8008015.
     let mut options = plist::Dictionary::new();
     options.insert("PackageType".into(), "Developer".into());
-    ui::status("installing");
+    ui::status("установка");
     let installed = proxy
         .install_with_callback(
             remote_root.clone(),
             Some(plist::Value::Dictionary(options)),
             |(percent, _): (u64, ())| async move {
-                ui::percent("installed", percent);
+                ui::percent("установлено", percent);
             },
             (),
         )
@@ -168,22 +157,18 @@ pub async fn install(connection: &mut Connection, app_dir: &Path) -> Result<Stri
 
 fn install_advice(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    // `Engine.isAppLimitError`'s two phrasings.
     if lower.contains("maximum number of installed apps")
         || lower.contains("maximum number of apps for free development profiles")
     {
-        "This iPhone already has 3 apps signed with a free Apple Account. Delete one, then run siboot again.".into()
+        "На iPhone уже установлены 3 приложения, подписанные бесплатной учётной записью Apple. Удалите одно и снова запустите siboot.".into()
     } else if lower.contains("0xe8008015") || lower.contains("provisioning") {
-        "installd refused the provisioning profile. Run siboot again; if it keeps failing, the \
-         profile may not include this iPhone."
+        "installd отклонил профиль подготовки. Запустите siboot снова; если ошибка повторится, возможно, в профиль не включён этот iPhone."
             .into()
     } else {
-        "installd refused SideInstaller.".into()
+        "installd отказал в установке приложения.".into()
     }
 }
 
-/// Every folder and file under `root`, each folder before what's in it, in a
-/// stable order.
 pub fn bundle_entries(root: &Path) -> std::io::Result<Vec<Entry>> {
     let mut out = Vec::new();
     walk(root, root, &mut out)?;
@@ -201,7 +186,6 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Entry>) -> std::io::Result<()> {
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .to_string_lossy()
             .replace('\\', "/");
-        // Follows symlinks: AFC uploads their contents as plain files.
         let meta = std::fs::metadata(&path)?;
         if meta.is_dir() {
             out.push(Entry {
@@ -262,12 +246,12 @@ mod tests {
     fn install_refusals_get_advice() {
         assert!(
             install_advice("ApplicationVerificationFailed: 0xe8008015 profile")
-                .contains("provisioning profile")
+                .contains("профиль подготовки")
         );
         assert!(
             install_advice("This device has reached the maximum number of installed apps")
-                .contains("3 apps")
+                .contains("3 приложения")
         );
-        assert!(install_advice("something else").contains("refused"));
+        assert!(install_advice("something else").contains("отказал"));
     }
 }

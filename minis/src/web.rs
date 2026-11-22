@@ -1,30 +1,3 @@
-//! The run as a page in Open Minis's own browser, to tap rather than type:
-//! the way siboot runs in Minis, unless it's given `--terminal`.
-//!
-//! siboot serves the page on this iPhone's loopback, at a port the system
-//! picks, under a path of 128 random bits (the key), and opens it with Minis's
-//! `minis-open`, which shows it in a sheet over the terminal. Minis stays in
-//! front, so iOS doesn't pause it, as it would behind Safari: a paused app
-//! takes the connection and never answers.
-//!
-//! The page reads the run as server-sent events (`events`): every event since
-//! the start, then each new one as it happens, so a page opened again draws
-//! the same screen. It answers siboot's questions with a POST (`answer`), and
-//! can stop the run (`stop`). Nothing else is served.
-//!
-//! The key keeps the rest of the iPhone out. Any app on it, and any website
-//! open in a browser on it, can reach a loopback port, but none can guess the
-//! key, and every path starts with it. The listener is on 127.0.0.1 only, so
-//! nothing on the Wi-Fi reaches it at all. On top of that, the Host header must
-//! name this loopback and port (no DNS rebinding), a POST must be JSON (a form
-//! on another site can't send that without a preflight, which is refused) and
-//! come from this page's own origin when it names one, and the page can't be
-//! framed, sends no referrer and loads nothing from anywhere else.
-//!
-//! What's typed in the page goes to the question that asked for it and no
-//! further: an answer is never sent back to the page, and the run's log only
-//! says that something was typed (`ui::record_answer`).
-
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -36,30 +9,20 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-/// The page: one file, its style and script inline.
 const PAGE: &str = include_str!("web.html");
-/// Nothing from anywhere else, and no one else's frame.
 const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
                    connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; \
                    frame-ancestors 'none'";
-/// A request's line and headers are never longer, nor a POST's body.
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY: usize = 4 * 1024;
-/// Connections at once. The page keeps one open and makes one for each
-/// answer; a reload or two more is plenty.
 const MAX_CONNECTIONS: usize = 16;
-/// How long a request may take to arrive, and a write to go out.
 const READ_WAIT: Duration = Duration::from_secs(10);
 const WRITE_WAIT: Duration = Duration::from_secs(10);
-/// How often a quiet event stream says it's still there. The page calls
-/// siboot unreachable after three of these go missing.
 const HEARTBEAT: Duration = Duration::from_secs(5);
-/// How long closing waits for the page to have every event.
 const CLOSE_WAIT: Duration = Duration::from_secs(3);
 
 static SERVER: OnceLock<Server> = OnceLock::new();
 
-/// Serves the page for this run, from now on; its address.
 pub fn start() -> io::Result<String> {
     let server = Server::bind()?;
     let url = server.url();
@@ -69,19 +32,16 @@ pub fn start() -> io::Result<String> {
     Ok(url)
 }
 
-/// The page, once `start` serves it.
 pub fn page() -> Option<&'static Server> {
     SERVER.get()
 }
 
-/// An event for the page, if there is one.
 pub fn send(event: Value) {
     if let Some(server) = page() {
         server.send(event);
     }
 }
 
-/// Progress under the running step, if there's a page.
 pub fn progress(label: &str, done: u64, total: u64, bytes: bool) {
     if let Some(server) = page() {
         server.progress(label, done, total, bytes);
@@ -94,7 +54,6 @@ pub fn progress_end() {
     }
 }
 
-/// What the page's Stop does, on the thread that took the request.
 pub fn on_stop(stop: impl Fn() + Send + Sync + 'static) {
     if let Some(server) = page() {
         *server
@@ -105,17 +64,13 @@ pub fn on_stop(stop: impl Fn() + Send + Sync + 'static) {
     }
 }
 
-/// Tells the page the run is over, and gives it a moment to have every
-/// event. Safe to call more than once, and without a page.
 pub fn close() {
     if let Some(server) = page() {
         server.close();
     }
 }
 
-/// Waits until a browser has the page open, for at most `longest`; whether
-/// one does. The screens example plays its made-up run only once it's seen.
-#[allow(dead_code)] // siboot itself doesn't wait: the page replays the run
+#[allow(dead_code)]
 pub fn wait_for_page(longest: Duration) -> bool {
     let Some(server) = page() else { return false };
     let shared = &server.shared;
@@ -135,7 +90,6 @@ pub fn wait_for_page(longest: Duration) -> bool {
     true
 }
 
-/// Whether this is Open Minis, which has `minis-open` to show the page.
 pub fn available() -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| {
@@ -146,9 +100,6 @@ pub fn available() -> bool {
     })
 }
 
-/// Opens `url` in Open Minis's browser, in a sheet over its terminal:
-/// `minis-open` prints the escape Minis's terminal turns into one, so its
-/// output goes to the terminal. False where there's no `minis-open`.
 pub fn show(url: &str) -> bool {
     Command::new("minis-open")
         .arg(url)
@@ -174,25 +125,19 @@ struct Shared {
 
 #[derive(Default)]
 struct State {
-    /// Every event so far, as JSON. An event's id is its index.
     events: Vec<String>,
-    /// The question waiting for the page, and its answer once given.
     asking: Option<u64>,
     answer: Option<Value>,
     questions: u64,
-    /// The event streams open now, and how many events each has sent.
     streams: HashMap<u64, usize>,
     stream_ids: u64,
-    /// The progress last sent, so a bar sends one event a percent.
     progress: Option<(String, u64)>,
     ended: bool,
 }
 
-/// A six-digit code, or what the page asked for instead.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Code {
     Digits(String),
-    /// Other ways to get the code.
     More,
     Cancel,
 }
@@ -226,8 +171,6 @@ impl Server {
         self.shared.push(&mut state, event);
     }
 
-    /// Progress under the running step: an event only when the percentage
-    /// moves, so a bar is at most a hundred of them.
     pub fn progress(&self, label: &str, done: u64, total: u64, bytes: bool) {
         let percent = done
             .saturating_mul(100)
@@ -254,7 +197,6 @@ impl Server {
         self.shared.push(&mut state, json!({"t": "progress_end"}));
     }
 
-    /// Ask the page, and wait for its answer, however long it takes.
     fn ask(&self, mut question: Value) -> Value {
         let shared = &self.shared;
         let mut state = shared.lock();
@@ -279,8 +221,6 @@ impl Server {
         answer
     }
 
-    /// A line of text, or a password with `secret`. None when the page
-    /// cancels; an empty answer asks again.
     pub fn text(
         &self,
         question: &str,
@@ -306,8 +246,6 @@ impl Server {
         }
     }
 
-    /// Six digits, with `hints` under them (true for a warning); `more`
-    /// offers other ways to get the code. Anything but six digits asks again.
     pub fn code(&self, question: &str, label: &str, hints: &[(bool, &str)], more: bool) -> Code {
         let hints: Vec<Value> = hints
             .iter()
@@ -335,14 +273,11 @@ impl Server {
         }
     }
 
-    /// Yes or no; cancelling is no.
     pub fn confirm(&self, question: &str, default: bool) -> bool {
         let answer = self.ask(json!({"kind": "confirm", "question": question, "default": default}));
         answer["yes"].as_bool().unwrap_or(false)
     }
 
-    /// What to do elsewhere, as numbered `steps` with `notes` under them, and
-    /// `button` to start: true when it's tapped, false on Cancel.
     pub fn ready(&self, title: &str, steps: &[&str], notes: &[&str], button: &str) -> bool {
         let answer = self.ask(json!({
             "kind": "ready", "question": title, "steps": steps, "notes": notes, "button": button,
@@ -350,7 +285,6 @@ impl Server {
         answer["go"] == json!(true)
     }
 
-    /// One of `options`, by index. None when the page backs out.
     pub fn choose(&self, title: &str, options: &[String]) -> Option<usize> {
         loop {
             let answer = self.ask(json!({"kind": "choose", "question": title, "options": options}));
@@ -368,7 +302,6 @@ impl Server {
         }
     }
 
-    /// A line as plain output asks for one: anything, even nothing.
     pub fn line(&self, prompt: &str) -> Option<String> {
         let question = prompt.trim().trim_end_matches(':');
         let answer =
@@ -414,7 +347,6 @@ impl Shared {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Milliseconds since siboot started serving: the page's clock.
     fn now(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -427,7 +359,6 @@ impl Shared {
         self.changed.notify_all();
     }
 
-    /// What follows the key in `path`, if `path` starts with it.
     fn after_key<'a>(&self, path: &'a str) -> Option<&'a str> {
         let rest = path.strip_prefix('/')?;
         let (given, rest) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
@@ -448,7 +379,6 @@ impl Shared {
     }
 }
 
-/// Compared in the same time however much of it matches.
 fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -461,8 +391,6 @@ fn random_key() -> io::Result<String> {
         key
     }))
 }
-
-// ---------------------------------------------------------------- HTTP
 
 fn accept(shared: Arc<Shared>, listener: TcpListener) {
     for stream in listener.incoming() {
@@ -487,7 +415,6 @@ fn accept(shared: Arc<Shared>, listener: TcpListener) {
 struct Request {
     method: String,
     target: String,
-    /// Names in lowercase.
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -501,7 +428,6 @@ impl Request {
     }
 }
 
-/// One request off `stream`, or the status that refuses it.
 fn read_request(stream: &TcpStream) -> Result<Request, u16> {
     let _ = stream.set_read_timeout(Some(READ_WAIT));
     let mut reader = BufReader::new(stream);
@@ -612,8 +538,6 @@ fn handle(shared: &Shared, stream: TcpStream) -> io::Result<()> {
     }
 }
 
-/// A POST's JSON body, if it's from this page: JSON, and from its origin
-/// when the browser names one.
 fn posted_json(shared: &Shared, request: &Request) -> Result<Value, u16> {
     if let Some(origin) = request.header("origin") {
         if !shared.is_own_origin(origin) {
@@ -649,7 +573,6 @@ fn answer(shared: &Shared, stream: &TcpStream, request: &Request) -> io::Result<
             false
         }
     };
-    // 409: answered already, or not asked.
     respond(stream, if taken { 204 } else { 409 }, &[], b"")
 }
 
@@ -669,9 +592,6 @@ fn stop(shared: &Shared, stream: &TcpStream, request: &Request) -> io::Result<()
     Ok(())
 }
 
-/// The run, as server-sent events: every event since the one the browser
-/// last had (`Last-Event-ID`, which it sends when it reconnects), then each
-/// new one, and a `ping` with the time whenever it's quiet.
 fn events(shared: &Shared, mut stream: &TcpStream, request: &Request) -> io::Result<()> {
     stream.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n\
@@ -758,9 +678,6 @@ fn refuse(stream: &TcpStream, status: u16) -> io::Result<()> {
     )
 }
 
-/// After refusing a request that wasn't read to its end: let the refusal
-/// out before closing. Closing on unread input resets the connection, and
-/// the reply can go with it.
 fn linger(stream: &TcpStream) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
@@ -810,7 +727,6 @@ mod tests {
         format!("/{}", server.shared.key)
     }
 
-    /// Sends `raw` and reads the whole reply: its status, headers and body.
     fn exchange(server: &Server, raw: &str) -> (u16, Vec<(String, String)>, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", server.shared.port)).unwrap();
         stream
@@ -856,7 +772,6 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    /// An event stream from `last_id` on, and a reader for its events.
     fn subscribe(server: &Server, last_id: Option<usize>) -> BufReader<TcpStream> {
         let mut stream = TcpStream::connect(("127.0.0.1", server.shared.port)).unwrap();
         stream
@@ -873,7 +788,6 @@ mod tests {
         stream.write_all(raw.as_bytes()).unwrap();
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        // Past the headers.
         loop {
             line.clear();
             reader.read_line(&mut line).unwrap();
@@ -884,7 +798,6 @@ mod tests {
         reader
     }
 
-    /// The next event with an id (pings skipped): its id and its JSON.
     fn next_event(reader: &mut BufReader<TcpStream>) -> (usize, Value) {
         let mut id = None;
         let mut line = String::new();
@@ -902,7 +815,6 @@ mod tests {
         }
     }
 
-    /// Reads events until one of type `t`.
     fn until(reader: &mut BufReader<TcpStream>, t: &str) -> Value {
         loop {
             let (_, event) = next_event(reader);
@@ -1000,7 +912,7 @@ mod tests {
     fn events_are_replayed_then_streamed() {
         let server = served();
         server.send(json!({"t": "header", "version": "9.9.9"}));
-        server.send(json!({"t": "step", "n": 1, "title": "Checking"}));
+        server.send(json!({"t": "step", "n": 1, "title": "Проверка"}));
         let mut reader = subscribe(&server, None);
         let (id, first) = next_event(&mut reader);
         assert_eq!((id, first["t"].as_str()), (0, Some("header")));
@@ -1009,7 +921,6 @@ mod tests {
         server.send(json!({"t": "done", "summary": "fine"}));
         let (id, third) = next_event(&mut reader);
         assert_eq!((id, third["summary"].as_str()), (2, Some("fine")));
-        // A browser reconnecting after event 1 gets only what came since.
         let mut again = subscribe(&server, Some(1));
         assert_eq!(next_event(&mut again).0, 2);
     }
@@ -1031,7 +942,6 @@ mod tests {
         assert!(state.events.last().unwrap().contains("progress_end"));
     }
 
-    /// Asks on another thread, as the run does, and hands back its answer.
     fn asked<T: Send + 'static>(
         server: &'static Server,
         ask: impl FnOnce(&Server) -> T + Send + 'static,
@@ -1060,15 +970,15 @@ mod tests {
         let mut reader = subscribe(server, None);
         let email = asked(server, |s| {
             s.text(
-                "sign in to your Apple Account",
-                "Email",
-                "your Apple Account",
+                "войдите в учётную запись Apple",
+                "Электронная почта",
+                "адрес учётной записи Apple",
                 false,
             )
         });
         let question = until(&mut reader, "ask");
         assert_eq!(question["kind"], "text");
-        assert_eq!(question["label"], "Email");
+        assert_eq!(question["label"], "Электронная почта");
         let id = question["id"].as_u64().unwrap();
         assert_eq!(
             reply(server, id + 1, json!({"value": "x"})),
@@ -1086,7 +996,6 @@ mod tests {
         );
         assert_eq!(email.join().unwrap().as_deref(), Some("me@example.com"));
         assert_eq!(until(&mut reader, "answered")["id"], id);
-        // What was typed never goes back to the page.
         let state = server.shared.lock();
         assert!(state.events.iter().all(|e| !e.contains("me@example.com")));
     }
@@ -1095,7 +1004,7 @@ mod tests {
     fn an_empty_answer_asks_again_and_cancel_stops() {
         let server = leaked();
         let mut reader = subscribe(server, None);
-        let password = asked(server, |s| s.text("sign in", "Password", "", true));
+        let password = asked(server, |s| s.text("вход", "Пароль", "", true));
         let first = until(&mut reader, "ask");
         assert_eq!(first["kind"], "secret");
         assert_eq!(
@@ -1125,11 +1034,11 @@ mod tests {
         let mut reader = subscribe(server, None);
         let code = asked(server, |s| {
             s.code(
-                "enter the code Apple sent",
-                "Code",
+                "введите код от Apple",
+                "Код",
                 &[
-                    (true, "Apple: wrong code"),
-                    (false, "sent to your Apple devices"),
+                    (true, "Ответ Apple: неверный код"),
+                    (false, "отправлен на ваши устройства Apple"),
                 ],
                 true,
             )
@@ -1150,9 +1059,7 @@ mod tests {
         );
         assert_eq!(code.join().unwrap(), Code::Digits("123456".into()));
 
-        let code = asked(server, |s| {
-            s.code("enter the code Apple sent", "Code", &[], true)
-        });
+        let code = asked(server, |s| s.code("введите код от Apple", "Код", &[], true));
         let question = until(&mut reader, "ask");
         reply(
             server,
@@ -1161,9 +1068,8 @@ mod tests {
         );
         assert_eq!(code.join().unwrap(), Code::More);
 
-        // Without other ways on offer, asking for them asks again.
         let code = asked(server, |s| {
-            s.code("rootshell is offering its file", "Code", &[], false)
+            s.code("rootshell предлагает файл сопряжения", "Код", &[], false)
         });
         let question = until(&mut reader, "ask");
         reply(
@@ -1184,12 +1090,12 @@ mod tests {
     fn choices_and_confirmations() {
         let server = leaked();
         let mut reader = subscribe(server, None);
-        let options = vec!["Text it".to_string(), "Call".to_string()];
+        let options = vec!["Отправить SMS".to_string(), "Позвонить".to_string()];
         let chosen = asked(server, move |s| {
-            s.choose("how should Apple send the code?", &options)
+            s.choose("как Apple отправит код?", &options)
         });
         let question = until(&mut reader, "ask");
-        assert_eq!(question["options"][1], "Call");
+        assert_eq!(question["options"][1], "Позвонить");
         reply(
             server,
             question["id"].as_u64().unwrap(),
@@ -1200,7 +1106,7 @@ mod tests {
         assert_eq!(chosen.join().unwrap(), Some(1));
 
         let confirmed = asked(server, |s| {
-            s.confirm("copy the log to the clipboard?", true)
+            s.confirm("скопировать журнал в буфер обмена?", true)
         });
         let question = until(&mut reader, "ask");
         assert_eq!(question["default"], true);
@@ -1218,23 +1124,33 @@ mod tests {
         let mut reader = subscribe(server, None);
         let started = asked(server, |s| {
             s.ready(
-                "Pair this iPhone with siboot",
-                &["Open Settings.", "Tap Pair with siboot."],
-                &["A player opens."],
-                "Start pairing",
+                "Сопряжение iPhone с siboot",
+                &["Откройте Настройки.", "Нажмите Pair with siboot."],
+                &["Откроется плеер."],
+                "Начать сопряжение",
             )
         });
         let question = until(&mut reader, "ask");
         assert_eq!(question["kind"], "ready");
-        assert_eq!(question["steps"][1], "Tap Pair with siboot.");
-        assert_eq!(question["notes"][0], "A player opens.");
-        assert_eq!(question["button"], "Start pairing");
-        reply(server, question["id"].as_u64().unwrap(), json!({"go": true}));
+        assert_eq!(question["steps"][1], "Нажмите Pair with siboot.");
+        assert_eq!(question["notes"][0], "Откроется плеер.");
+        assert_eq!(question["button"], "Начать сопряжение");
+        reply(
+            server,
+            question["id"].as_u64().unwrap(),
+            json!({"go": true}),
+        );
         assert!(started.join().unwrap());
 
-        let cancelled = asked(server, |s| s.ready("Pair", &["Open Settings."], &[], "Start"));
+        let cancelled = asked(server, |s| {
+            s.ready("Сопряжение", &["Откройте Настройки."], &[], "Начать")
+        });
         let question = until(&mut reader, "ask");
-        reply(server, question["id"].as_u64().unwrap(), json!({"cancel": true}));
+        reply(
+            server,
+            question["id"].as_u64().unwrap(),
+            json!({"cancel": true}),
+        );
         assert!(!cancelled.join().unwrap());
     }
 
@@ -1255,7 +1171,7 @@ mod tests {
     #[test]
     fn closing_ends_the_stream_and_waits_for_the_page() {
         let server = served();
-        server.send(json!({"t": "finish", "title": "Done"}));
+        server.send(json!({"t": "finish", "title": "Готово"}));
         let mut reader = subscribe(&server, None);
         let started = Instant::now();
         server.close();
@@ -1270,7 +1186,6 @@ mod tests {
             .filter(|e| e.contains("\"end\""))
             .count();
         assert_eq!(ends, 1);
-        // With no page at all, closing doesn't wait.
         let alone = served();
         let started = Instant::now();
         alone.close();

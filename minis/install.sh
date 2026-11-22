@@ -1,38 +1,23 @@
 #!/bin/sh
-# Installs siboot into Open Minis and runs it, which pairs this iPhone with
-# itself (Open Minis 1.16 and later; siboot stops in an older one), signs
-# SideInstaller with your Apple Account and installs it.
-#
-# In Minis's terminal (Minis › Settings › Terminal):
-#
-#   wget -qO- https://raw.githubusercontent.com/FrizzleM/siboot/main/minis/install.sh | sh
-#
-# Afterwards `siboot` runs it again, without downloading.
 set -eu
 
-BASE="${SIBOOT_BASE:-https://raw.githubusercontent.com/FrizzleM/siboot/main/minis}"
-# Of bin/siboot-aarch64, updated with it: a download that doesn't match (an
-# error page, a cut-off transfer) is never run. SIZE only draws the progress
-# bar.
-SHA256="724f070819d4b328d375f5e43f32f1b11508c1d4a4362411e9476263f057e8a6"
-SIZE=12209056
+BASE="${SIBOOT_BASE:-https://raw.githubusercontent.com/ripcats/siboot-ru/main/minis}"
+SHA256="cf6b604137f654113522f6f254ac69f060498ef83fd5e7243372406743231b46"
+SIZE=12143448
 
 DIR="$HOME/.siboot/bin"
 BIN="$DIR/siboot"
 
-# On a terminal, one line that redraws itself, as siboot's own screen does.
 FANCY=
 if [ -t 1 ] && [ "${TERM:-}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
   FANCY=1
 fi
 
-# The terminal's width, so no line wraps by itself.
 COLS=$({ stty size < /dev/tty; } 2> /dev/null | cut -d ' ' -f 2) || COLS=
 case "$COLS" in
   '' | *[!0-9]*) COLS=40 ;;
 esac
 
-# A line that stays: a mark in a color, then the text wrapped under itself.
 say() {
   if [ -z "$FANCY" ]; then
     echo "$3"
@@ -59,7 +44,7 @@ fail() {
 
 case "$(uname -m)" in
   aarch64 | arm64) ;;
-  *) fail "siboot runs in Open Minis on an iPhone (aarch64); this is $(uname -m)." ;;
+  *) fail "siboot работает в Open Minis на iPhone (aarch64); текущая архитектура — $(uname -m)." ;;
 esac
 
 fetch() {
@@ -72,7 +57,6 @@ fetch() {
 
 sha() { sha256sum "$1" | cut -d ' ' -f 1; }
 
-# `n` copies of a string.
 repeat() {
   n=$1
   out=
@@ -83,13 +67,11 @@ repeat() {
   printf '%s' "$out"
 }
 
-# Tenths of a megabyte, as "10.7".
 megabytes() {
   tenths=$(($1 * 10 / 1048576))
   printf '%d.%d' $((tenths / 10)) $((tenths % 10))
 }
 
-# One frame: spinner, bar, percentage and, where there's room, megabytes.
 frame() {
   have=$1
   case $2 in
@@ -98,8 +80,7 @@ frame() {
   esac
   percent=$((have * 100 / SIZE))
   [ "$percent" -gt 99 ] && percent=99
-  size=" $(megabytes "$have")/$(megabytes "$SIZE") MB"
-  # "  ⠋ Downloading siboot " and " 42%", a column spare.
+  size=" $(megabytes "$have")/$(megabytes "$SIZE") МБ"
   cells=$((COLS - 29))
   if [ "$cells" -ge $((12 + ${#size})) ]; then
     cells=$((cells - ${#size}))
@@ -109,16 +90,14 @@ frame() {
   [ "$cells" -gt 24 ] && cells=24
   [ "$cells" -lt 4 ] && cells=4
   full=$((percent * cells / 100))
-  printf '\r\033[2K  \033[36m%s\033[0m Downloading siboot \033[36m%s\033[0m\033[2m%s\033[0m %3d%%%s' \
+  printf '\r\033[2K  \033[36m%s\033[0m Загрузка siboot \033[36m%s\033[0m\033[2m%s\033[0m %3d%%%s' \
     "$spin" "$(repeat "$full" ━)" "$(repeat $((cells - full)) ─)" "$percent" "$size"
 }
 
-# The download in the background, and a frame every tenth of a second from
-# how much of it has arrived.
 download() {
   rm -f "$BIN.part"
   if [ -z "$FANCY" ]; then
-    echo "downloading siboot ($(megabytes "$SIZE") MB) …"
+    echo "Загрузка siboot ($(megabytes "$SIZE") МБ)…"
     fetch "$BASE/bin/siboot-aarch64" "$BIN.part"
     return
   fi
@@ -136,27 +115,23 @@ download() {
 
 mkdir -p "$DIR"
 if [ -f "$BIN" ] && [ "$(sha "$BIN")" = "$SHA256" ]; then
-  ok "siboot is up to date"
+  ok "siboot уже обновлён"
 else
   if ! download; then
     rm -f "$BIN.part"
-    fail "Couldn't download siboot. Check the internet connection and try again."
+    fail "Не удалось загрузить siboot. Проверьте подключение к интернету и повторите попытку."
   fi
   if [ "$(sha "$BIN.part")" != "$SHA256" ]; then
     rm -f "$BIN.part"
-    fail "The siboot download didn't match its checksum. Try again in a few minutes."
+    fail "Контрольная сумма siboot не совпала. Повторите попытку через несколько минут."
   fi
   chmod 755 "$BIN.part"
   mv "$BIN.part" "$BIN"
-  ok "siboot downloaded and checked ($(megabytes "$SIZE") MB)"
+  ok "siboot загружен и проверен ($(megabytes "$SIZE") МБ)"
 fi
 
-# So `siboot` works on its own from now on (Minis's shell runs as root).
 ln -sf "$BIN" /usr/local/bin/siboot 2> /dev/null || true
 
-# Piped into sh, stdin is this script, and siboot's prompts need the terminal.
-# The test opens it in a subshell: a redirection that fails on `:`, a special
-# built-in, would end this shell, where there's no terminal at all.
 if [ -t 0 ]; then
   exec "$BIN" "$@"
 elif [ -r /dev/tty ] && (: < /dev/tty) 2> /dev/null; then

@@ -1,13 +1,3 @@
-//! The log siboot offers to copy when a run stops: what the screen showed,
-//! the libraries' own log lines and the underlying error, as plain text.
-//!
-//! It goes to the clipboard through Open Minis's `apple-clipboard set`, which
-//! reads the text on stdin (Minis's terminal ignores OSC 52), and is saved to
-//! ~/.siboot/siboot.log either way. Before either, the Apple Account's email
-//! and long identifiers (the iPhone's UDID, anisette identities) are cut short:
-//! the log is meant to be pasted where you ask for help. Passwords and codes
-//! never reach it (`ui::record_answer`).
-
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, Stdio};
@@ -17,8 +7,6 @@ use crate::{ui, Args, Command, VERSION};
 
 pub const LOG_FILE: &str = "siboot.log";
 
-/// After a failure the user didn't choose: save the log, and on a terminal or
-/// the page ask whether to copy it.
 pub fn after_failure(args: &Args, f: &Fail) {
     if f.by_user || f.known {
         return;
@@ -31,13 +19,13 @@ pub fn after_failure(args: &Args, f: &Fail) {
         || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
     if !asks {
         if saved {
-            ui::note(&format!("The run's log is in {shown}."));
+            ui::note(&format!("Журнал этого запуска сохранён: {shown}."));
         }
         return;
     }
-    if !ui::confirm("copy the log to the clipboard?", true) {
+    if !ui::confirm("скопировать журнал в буфер обмена?", true) {
         if saved {
-            ui::note(&format!("The log is in {shown}."));
+            ui::note(&format!("Журнал сохранён: {shown}."));
         }
         return;
     }
@@ -45,17 +33,16 @@ pub fn after_failure(args: &Args, f: &Fail) {
         Ok(()) => {
             let lines = text.lines().count();
             ui::ok(&format!(
-                "Copied the log ({lines} lines). Paste it where you ask for help."
+                "Журнал скопирован ({lines} строк). Вставьте его в обращение за помощью."
             ));
         }
-        Err(why) => ui::warn(&format!("Couldn't copy the log: {why}.")),
+        Err(why) => ui::warn(&format!("Не удалось скопировать журнал: {why}.")),
     }
     if saved {
-        ui::note(&format!("It's also in {shown}."));
+        ui::note(&format!("Копия также сохранена: {shown}."));
     }
 }
 
-/// The log: a header, then the run, cleaned.
 fn compose(args: &Args) -> String {
     let command = match args.command {
         Command::All => "install",
@@ -78,14 +65,12 @@ fn compose(args: &Args) -> String {
     redact(&out, args.apple_id.as_deref())
 }
 
-/// The options given, without their values: those can be an email or a path.
 fn flags_given(args: impl Iterator<Item = String>) -> Vec<String> {
     args.filter(|a| a.starts_with('-'))
         .map(|a| a.split('=').next().unwrap_or("").to_string())
         .collect()
 }
 
-/// The kernel iSH says it is, and the terminal.
 fn system() -> String {
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|k| k.trim().to_string())
@@ -98,7 +83,6 @@ fn system() -> String {
     )
 }
 
-/// `~/.siboot/siboot.log` rather than `/root/.siboot/siboot.log`.
 fn shown_path(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
@@ -107,14 +91,12 @@ fn shown_path(path: &Path) -> String {
     }
 }
 
-/// Onto the clipboard: Open Minis's `apple-clipboard`, else `pbcopy` (a Mac,
-/// running the screens example).
 fn copy(text: &str) -> Result<(), String> {
     match pipe_to("apple-clipboard", &["set"], text) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             pipe_to("pbcopy", &[], text).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    "there's no apple-clipboard here (it comes with Open Minis)".to_string()
+                    "команда apple-clipboard не найдена (она входит в Open Minis)".to_string()
                 } else {
                     e.to_string()
                 }
@@ -127,7 +109,6 @@ fn copy(text: &str) -> Result<(), String> {
 fn pipe_to(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
     let mut process = Process::new(program);
     if program == "pbcopy" {
-        // Else it reads the text as Mac Roman.
         process.env("LANG", "en_US.UTF-8");
     }
     let mut child = process
@@ -143,12 +124,12 @@ fn pipe_to(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::other(format!("{program} answered {status}")))
+        Err(std::io::Error::other(format!(
+            "{program} answered {status}"
+        )))
     }
 }
 
-/// The email cut to its first letter and domain, and any long run of hex
-/// digits (a UDID, an anisette identity, a key) to its ends.
 fn redact(text: &str, apple_id: Option<&str>) -> String {
     let mut text = text.to_string();
     if let Some(id) = apple_id.map(str::trim).filter(|id| !id.is_empty()) {
@@ -168,7 +149,6 @@ fn short_email(email: &str) -> String {
     }
 }
 
-/// Every `name@domain.tld` in `text`, shortened.
 fn emails(text: &str) -> String {
     let local = |c: char| c.is_ascii_alphanumeric() || "._%+-".contains(c);
     let domain = |c: char| c.is_ascii_alphanumeric() || ".-".contains(c);
@@ -188,7 +168,6 @@ fn emails(text: &str) -> String {
             let host: String = chars[i + 1..end].iter().collect();
             let host = host.trim_end_matches('.');
             if start < i && host.contains('.') {
-                // The local part is already in `out`: take it back.
                 for _ in start..i {
                     out.pop();
                 }
@@ -204,8 +183,6 @@ fn emails(text: &str) -> String {
     out
 }
 
-/// Runs of 20 or more hex digits (dashes allowed between), kept to their
-/// first and last four.
 fn long_hex(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut run = String::new();
@@ -215,7 +192,14 @@ fn long_hex(text: &str) -> String {
         if digits >= 20 && has_digit {
             let trimmed = run.trim_matches('-');
             let head: String = trimmed.chars().take(4).collect();
-            let tail: String = trimmed.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+            let tail: String = trimmed
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
             let lead = &run[..run.len() - run.trim_start_matches('-').len()];
             let trail = &run[run.trim_end_matches('-').len()..];
             out.push_str(&format!("{lead}{head}…{tail}{trail}"));
@@ -242,10 +226,10 @@ mod tests {
 
     #[test]
     fn the_apple_account_is_cut_to_a_letter_and_its_domain() {
-        let text = "signing in as jane.doe+x@icloud.com, then mail@example.org.";
+        let text = "вход для jane.doe+x@icloud.com, затем mail@example.org.";
         assert_eq!(
             redact(text, Some("jane.doe+x@icloud.com")),
-            "signing in as j…@icloud.com, then m…@example.org."
+            "вход для j…@icloud.com, затем m…@example.org."
         );
     }
 
@@ -274,7 +258,14 @@ mod tests {
 
     #[test]
     fn options_are_kept_without_their_values() {
-        let given = ["developer-mode", "--turn-on", "--apple-id", "me@x.com", "--home=/tmp/x", "-v"];
+        let given = [
+            "developer-mode",
+            "--turn-on",
+            "--apple-id",
+            "me@x.com",
+            "--home=/tmp/x",
+            "-v",
+        ];
         assert_eq!(
             flags_given(given.iter().map(|s| s.to_string())),
             ["--turn-on", "--apple-id", "--home", "-v"]

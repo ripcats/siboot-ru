@@ -1,31 +1,3 @@
-//! siboot's live screen through a made-up run, for working on the UI without
-//! an iPhone. Nothing here talks to a device or to Apple:
-//!
-//! ```sh
-//! cargo run --example screens                  # an install, pairing in Minis
-//! cargo run --example screens -- rootshell     # taking rootshell's pairing
-//! cargo run --example screens -- stop          # one that stops at Connect
-//! cargo run --example screens -- old-minis     # in an Open Minis before 1.16
-//! cargo run --example screens -- teams         # an Apple Account on two teams
-//! cargo run --example screens -- saved         # two saved Apple Accounts
-//! cargo run --example screens -- saved run-out # whose saved sign-in has run out
-//! cargo run --example screens -- moved         # the pairing service on 55021
-//! cargo run --example screens -- nowhere       # and on no port at all
-//! cargo run --example screens -- developer-mode
-//! cargo run --example screens -- --plain       # the same, as plain lines
-//! cargo run --example screens -- --web         # the same, as the page
-//! ```
-//!
-//! A run that stops at Connect then asks whether to copy the log, as siboot
-//! does; on a Mac, yes puts it on the clipboard with `pbcopy`.
-//!
-//! With `--web` the run is served as siboot serves it, on the loopback, and
-//! its address printed; it starts once a browser has the page open, and the
-//! questions are answered there. `--open` opens it with macOS's `open`.
-//!
-//! The codes it asks for are 481516 (transfer) and 123456 (Apple's). The
-//! pairing code it shows is 975 088.
-
 #![allow(dead_code)]
 
 #[path = "../src/saved.rs"]
@@ -48,14 +20,14 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
     let page = if has("--web") {
-        Some(web::start().expect("a loopback port for the page"))
+        Some(web::start().expect("порт локального веб-сервера"))
     } else {
         None
     };
     ui::init(false, has("--plain") || page.is_some());
     if let Some(url) = &page {
-        web::on_stop(|| ui::stop_now("Stopped from the page."));
-        println!("The page: {url}");
+        web::on_stop(|| ui::stop_now("Остановлено со страницы."));
+        println!("Страница: {url}");
         if has("--open") {
             let _ = std::process::Command::new("open").arg(url).status();
         }
@@ -78,12 +50,20 @@ fn main() {
     let code = if has("old-minis") {
         old_minis();
         1
-    } else if run(devmode, stop, has("rootshell"), has("teams"), port, remembered) {
+    } else if run(
+        devmode,
+        stop,
+        has("rootshell"),
+        has("teams"),
+        port,
+        remembered,
+    ) {
         0
     } else {
         1
     };
-    if (stop || port == Port::Nowhere) && ui::confirm("copy the log to the clipboard?", true) {
+    if (stop || port == Port::Nowhere) && ui::confirm("скопировать журнал в буфер обмена?", true)
+    {
         let log = ui::recorded().join("\n");
         let copied = std::process::Command::new("pbcopy")
             .env("LANG", "en_US.UTF-8")
@@ -96,82 +76,78 @@ fn main() {
             });
         match copied {
             Ok(status) if status.success() => ui::ok(&format!(
-                "Copied the log ({} lines). Paste it where you ask for help.",
+                "Журнал скопирован (строк: {}). Вставьте его в обращение за помощью.",
                 log.lines().count()
             )),
-            _ => ui::warn("Couldn't copy the log: there's no pbcopy here."),
+            _ => ui::warn("Не удалось скопировать журнал: команда pbcopy недоступна."),
         }
-        ui::note("It's also in ~/.siboot/siboot.log.");
+        ui::note("Копия также сохранена в ~/.siboot/siboot.log.");
     }
     ui::close();
     std::process::exit(code);
 }
 
-/// The stop in an Open Minis older than 1.16 (preflight.rs), with no log to
-/// offer after it.
 fn old_minis() {
-    ui::header("0.18.1", "Installs SideInstaller on this iPhone.");
+    ui::header("0.21.0", "Устанавливает SideInstaller на этот iPhone.");
     ui::plan(
-        &["Check", "Pairing", "Connect", "Apple ID", "Sign", "Install", "Handover"],
+        &[
+            "Связь с iPhone",
+            "Файл сопряжения",
+            "Туннель к iPhone",
+            "Вход в Apple ID",
+            "Подпись SideInstaller",
+            "Копирование на iPhone",
+            "Настройка SideInstaller",
+        ],
         7,
     );
-    ui::step(1, "Checking LocalDevVPN, this iPhone and the internet");
-    ui::activity("checking this Open Minis");
+    ui::step(1, "Проверка LocalDevVPN и iPhone");
+    ui::activity("проверка Open Minis");
     wait(400);
-    ui::link("Update Open Minis", "itms-apps://apps.apple.com/app/id6759188481");
+    ui::link(
+        "Обновить Open Minis",
+        "itms-apps://apps.apple.com/app/id6759188481",
+    );
     ui::failure(
-        "This Open Minis is older than 1.16, and siboot needs Open Minis 1.16 or later: it's the \
-         first that can pair this iPhone. Update Open Minis in the App Store, open it again and \
-         run siboot.",
+        "Эта версия Open Minis старее 1.16. Для сопряжения iPhone нужна версия 1.16 или новее. Обновите Open Minis в App Store, откройте приложение и снова запустите siboot.",
         "",
     );
 }
 
-/// Where step 1 finds the iPhone's pairing service (preflight.rs).
 #[derive(Clone, Copy, PartialEq)]
 enum Port {
-    /// On 49152, as nearly always.
     Usual,
-    /// 49152 refuses, and the look through the other ports finds it.
     Moved,
-    /// Nothing answers as it on any port.
     Nowhere,
 }
 
-/// Step 1's dial of the pairing service, and the look through the iPhone's
-/// other ports that follows a refusal.
 fn reach(port: Port) -> bool {
-    ui::activity("reaching this iPhone at 10.7.0.1:49152");
+    ui::activity("подключение к iPhone по адресу 10.7.0.1:49152");
     wait(500);
     if port == Port::Usual {
-        ui::ok("this iPhone answers on 10.7.0.1:49152 (RPPairing, wire protocol 26)");
+        ui::ok("iPhone отвечает по адресу 10.7.0.1:49152 (RPPairing, версия протокола 26)");
         return true;
     }
     ui::detail(
-        "no pairing service at 10.7.0.1:49152: Connection refused (os error 111) \
-         (ConnectionRefused)",
+        "служба сопряжения по адресу 10.7.0.1:49152 не найдена: соединение отклонено (os error 111) (ConnectionRefused)",
     );
-    ui::status("looking for this iPhone's pairing service on its other ports");
-    // 55021 is 5869 of the 16382 ports in; nowhere knocks on all of them.
+    ui::status("поиск службы сопряжения iPhone на других портах");
     let last = if port == Port::Moved { 35 } else { 100 };
     for percent in 0..=last {
-        ui::percent("ports checked", percent);
+        ui::percent("проверено портов", percent);
         wait(40);
     }
     ui::progress_end();
     if port == Port::Nowhere {
         ui::failure(
-            "The iPhone refused the connection at 10.7.0.1:49152, and no other port on it answers \
-             as its pairing service. Turn on Developer Mode (Settings › Privacy & Security › \
-             Developer Mode), and check Wi-Fi is on. If both are on, restart the iPhone, connect \
-             LocalDevVPN again and run siboot again.",
+            "iPhone отклонил соединение по адресу 10.7.0.1:49152; на других портах служба сопряжения не найдена. Включите режим разработчика (Настройки › Конфиденциальность и безопасность › Режим разработчика) и проверьте Wi-Fi. Если они включены, перезагрузите iPhone, подключите LocalDevVPN и снова запустите siboot.",
             "Connection refused (os error 111) (ConnectionRefused); no other port answered as it \
              (16382 knocked on in 4.1 s; took the connection: 54666)",
         );
         return false;
     }
-    ui::detail("found it on port 55021 after 5869 of 16382 ports, in 1.4 s");
-    ui::ok("this iPhone answers on 10.7.0.1:55021 (RPPairing, wire protocol 26)");
+    ui::detail("служба найдена на порту 55021 (проверено 5869 из 16382 портов, время: 1,4 с)");
+    ui::ok("iPhone отвечает по адресу 10.7.0.1:55021 (RPPairing, версия протокола 26)");
     true
 }
 
@@ -184,40 +160,38 @@ fn run(
     remembered: Option<Remembered>,
 ) -> bool {
     let steps = [
-        "Check", "Pairing", "Connect", "Apple ID", "Sign", "Install", "Handover",
+        "Связь с iPhone",
+        "Файл сопряжения",
+        "Туннель к iPhone",
+        "Вход в Apple ID",
+        "Подпись SideInstaller",
+        "Копирование на iPhone",
+        "Настройка SideInstaller",
     ];
     if devmode {
-        ui::header("0.18.0", "Shows Developer Mode, or turns it on.");
-        ui::plan(&["Check", "Pairing", "Connect", "Dev Mode"], 4);
+        ui::header("0.21.0", "Показывает режим разработчика или включает его.");
+        ui::plan(
+            &[
+                "Связь с iPhone",
+                "Файл сопряжения",
+                "Туннель к iPhone",
+                "Режим разработчика",
+            ],
+            4,
+        );
     } else {
-        ui::header("0.18.0", "Installs SideInstaller on this iPhone.");
+        ui::header("0.21.0", "Устанавливает SideInstaller на этот iPhone.");
         ui::plan(&steps, 7);
     }
 
-    ui::step(1, "Checking LocalDevVPN, this iPhone and the internet");
-    for (what, took, answer) in [
-        (
-            "reaching GitHub",
-            700,
-            "GitHub answers, and the SideInstaller release is there",
-        ),
-        (
-            "reaching Apple's sign-in server",
-            600,
-            "Apple's sign-in server answers",
-        ),
-    ] {
-        ui::activity(what);
-        wait(took);
-        ui::ok(answer);
-    }
+    ui::step(1, "Проверка LocalDevVPN и iPhone");
     if !reach(port) {
         return false;
     }
-    ui::done("online, and the iPhone answers");
+    ui::done("iPhone отвечает");
 
-    ui::step(2, "Pairing this iPhone with siboot");
-    ui::activity("checking that Open Minis can pair this iPhone");
+    ui::step(2, "Сопряжение iPhone с siboot");
+    ui::activity("проверка возможности сопряжения через Open Minis");
     wait(500);
     if rootshell {
         if !take_from_rootshell() {
@@ -226,66 +200,91 @@ fn run(
     } else if !pair_here() {
         return false;
     }
-    ui::step(3, "Connecting to this iPhone through LocalDevVPN");
+    ui::step(3, "Подключение к iPhone через LocalDevVPN");
     for (what, took) in [
-        ("greeting the iPhone", 300),
-        ("checking the pairing with it", 500),
-        ("asking the iPhone for a tunnel listener", 600),
-        ("starting the encrypted tunnel", 1400),
-        ("reading the iPhone's services", 900),
-        ("asking lockdownd about this iPhone", 500),
+        ("установление связи с iPhone", 300),
+        ("проверка файла сопряжения", 500),
+        ("запрос туннельного порта у iPhone", 600),
+        ("запуск защищённого туннеля", 1400),
+        ("получение списка служб iPhone", 900),
+        ("запрос сведений об iPhone у lockdownd", 500),
     ] {
         ui::activity(what);
         wait(took);
         if stop && what == "starting the encrypted tunnel" {
             ui::failure(
-                "Timed out while starting the encrypted tunnel.",
+                "Истекло время ожидания запуска защищённого туннеля.",
                 "no answer within 20 s",
             );
             return false;
         }
     }
-    ui::ok("Frizzle's iPhone — iPhone18,1 on iOS 27.1");
-    ui::done("Frizzle's iPhone · iOS 27.1");
+    ui::ok("iPhone Frizzle — iPhone18,1, iOS 27.1");
+    ui::done("iPhone Frizzle · iOS 27.1");
 
     if devmode {
-        ui::step(4, "Asking this iPhone for Developer Mode");
-        ui::activity("asking whether Developer Mode is on");
+        ui::step(4, "Запрос режима разработчика на iPhone");
+        ui::activity("проверка режима разработчика");
         wait(700);
-        ui::status("Developer Mode is off");
+        ui::status("Режим разработчика выключен");
         ui::warn(
-            "Without a passcode, this iPhone restarts right away to turn Developer Mode on, and \
-             Minis stops with it. Once you unlock it, tap Turn On in the alert iOS shows.",
+            "Без код-пароля iPhone сразу перезагрузится для включения режима разработчика, а Minis остановится. После разблокировки нажмите «Включить» в уведомлении iOS.",
         );
-        ui::note("With a passcode, iOS refuses, and siboot shows the switch in Settings instead.");
-        if !ui::confirm("turn it on now?", false) {
+        ui::note("Если установлен код-пароль, iOS откажет, и siboot вместо этого покажет переключатель в Настройках.");
+        if !ui::confirm("включить режим сейчас?", false) {
             ui::failure(
-                "Nothing was sent, so Developer Mode stays off. `siboot developer-mode` without \
-                 --turn-on only shows it in Settings, and restarts nothing.",
+                "Запрос не отправлен, режим разработчика остался выключен. Команда `siboot developer-mode` без --turn-on только показывает переключатель и не перезагружает iPhone.",
                 "",
             );
             return false;
         }
-        ui::activity("connecting to AMFI on the iPhone");
+        ui::activity("подключение к AMFI на iPhone");
         wait(800);
-        ui::done("set to turn on");
+        ui::done("включение запрошено");
         ui::finish(
-            "Developer Mode is turning on",
+            "Включение режима разработчика",
             &[
-                "This iPhone restarts now, and Minis stops with it.",
-                "Once you unlock it, tap Turn On.",
+                "iPhone сейчас перезагрузится, Minis остановится.",
+                "Разблокируйте iPhone и нажмите «Включить».",
             ],
         );
         return true;
     }
 
-    ui::step(4, "Signing in to your Apple Account");
+    if !vpn_handoff(
+        "Настройте интернет для входа в Apple ID",
+        &[
+            "Отключите LocalDevVPN, если он мешает обычному интернету.",
+            "При необходимости включите обычный VPN для Apple и GitHub.",
+        ],
+        "Продолжить ко входу в Apple ID",
+    ) {
+        return false;
+    }
+    for (what, took, answer) in [
+        (
+            "проверка доступности GitHub",
+            700,
+            "GitHub доступен, релиз SideInstaller найден",
+        ),
+        (
+            "проверка сервера входа Apple",
+            600,
+            "сервер входа Apple доступен",
+        ),
+    ] {
+        ui::activity(what);
+        wait(took);
+        ui::ok(answer);
+    }
+
+    ui::step(4, "Вход в учётную запись Apple");
     let picked = match remembered {
         Some(_) => saved_account(),
         None => ask_email().map(|_| Picked::Typed),
     };
     let Some(picked) = picked else {
-        ui::failure("No Apple Account given.", "");
+        ui::failure("Учётная запись Apple не указана.", "");
         return false;
     };
     let with_password = match picked {
@@ -301,17 +300,16 @@ fn run(
             return false;
         }
     } else {
-        ui::status("signing in through new.ani.sidestore.io");
+        ui::status("вход через new.ani.sidestore.io");
         wait(1400);
-        ui::detail("used the saved sign-in: Apple's sign-in lasts 341d 7h more");
+        ui::detail("использован сохранённый вход: он действует ещё 341 дн. 7 ч");
     }
     let (name, id, kind, first) = if teams {
-        // In Apple's order, which account.rs keeps: here the free team first.
         let listed = [
             ("Frizzle", "ABCDE12345", team::Kind::Free),
             ("Frizzle", "FGHIJ67890", team::Kind::Paid),
         ];
-        ui::status("reading your teams");
+        ui::status("получение списка команд разработчиков");
         wait(700);
         let labels: Vec<String> = listed
             .iter()
@@ -320,7 +318,7 @@ fn run(
         ui::status(&team::found(listed.len()));
         ui::note(team::NOTE);
         let Some(i) = ui::choose(team::QUESTION, &labels) else {
-            ui::failure("No developer team picked.", "");
+            ui::failure("Команда разработчиков не выбрана.", "");
             return false;
         };
         let (name, id, kind) = listed[i];
@@ -330,9 +328,9 @@ fn run(
     };
     let summary = team::summary(Some(name), id, kind);
     ui::ok(&if with_password {
-        format!("signed in — {summary}")
+        format!("вход выполнен — {summary}")
     } else {
-        format!("signed in without the password — {summary}")
+        format!("вход выполнен без пароля — {summary}")
     });
     if picked == Picked::Typed {
         ui::note(saved::SAVED);
@@ -343,19 +341,16 @@ fn run(
 
 fn ask_email() -> Option<String> {
     ui::ask_text(
-        "sign in to your Apple Account",
-        "Email",
-        "your Apple Account",
-        "Apple Account email: ",
+        "войдите в учётную запись Apple",
+        "Электронная почта",
+        "адрес учётной записи Apple",
+        "Электронная почта Apple ID: ",
     )
 }
 
-/// What the sign-in has saved, in `-- saved`.
 #[derive(Clone, Copy, PartialEq)]
 enum Remembered {
-    /// Two Apple Accounts, and the first one's sign-in still works.
     Lasting,
-    /// The same, but Apple wants the password again.
     RunOut,
 }
 
@@ -365,8 +360,6 @@ enum Picked {
     Typed,
 }
 
-/// The menu of saved Apple Accounts, as account.rs's `which_account` asks it:
-/// one picked, another typed, or one forgotten and the menu again.
 fn saved_account() -> Option<Picked> {
     let mut accounts = vec![
         "frizzle@icloud.com".to_string(),
@@ -390,9 +383,9 @@ fn saved_account() -> Option<Picked> {
                     _ => ui::choose(saved::FORGET_WHICH, &accounts),
                 };
                 if let Some(i) = index {
-                    if ui::confirm(&format!("forget {}?", accounts[i]), false) {
+                    if ui::confirm(&format!("забыть {}?", accounts[i]), false) {
                         let email = accounts.remove(i);
-                        ui::ok(&format!("forgot {email} and its saved sign-in"));
+                        ui::ok(&format!("Удалена запись {email} и сохранённый вход"));
                     }
                 }
             }
@@ -400,208 +393,231 @@ fn saved_account() -> Option<Picked> {
     }
 }
 
-/// The password, a server that doesn't answer, and Apple's code. False once
-/// the run has stopped.
 fn password_and_code() -> bool {
     let password = ui::ask_secret(
-        "sign in to your Apple Account",
-        "Password",
-        "it goes only to Apple",
-        "Password (not shown; it goes only to Apple): ",
+        "войдите в учётную запись Apple",
+        "Пароль",
+        "он будет отправлен только в Apple",
+        "Пароль (не отображается; отправляется только в Apple): ",
     );
     if !matches!(password, Ok(Some(ref p)) if !p.is_empty()) {
-        ui::failure("No password given.", "");
+        ui::failure("Пароль не указан.", "");
         return false;
     }
-    ui::status("signing in through new.ani.sidestore.io");
+    ui::status("вход через new.ani.sidestore.io");
     wait(1500);
-    ui::warn("new.ani.sidestore.io didn't work: anisette server answered 503 Service Unavailable");
-    ui::status("signing in through mac-ani.jkcoxson.com");
+    ui::warn(
+        "Сервер new.ani.sidestore.io не сработал: anisette-сервер ответил 503 Service Unavailable",
+    );
+    ui::status("вход через mac-ani.jkcoxson.com");
     wait(1200);
-    let mut hints = vec![ui::Hint::Plain("sent to your Apple devices".into())];
+    let mut hints = vec![ui::Hint::Plain(
+        "код отправлен на ваши устройства Apple".into(),
+    )];
     loop {
-        match ui::ask_code_or_more("enter the code Apple sent", "Code", &hints) {
+        match ui::ask_code_or_more("введите код от Apple", "Код", &hints) {
             Some(ui::CodeAnswer::Code(code)) if code == "123456" => break,
             Some(ui::CodeAnswer::Code(_)) => {
                 hints.retain(|hint| !matches!(hint, ui::Hint::Warning(_)));
                 hints.insert(
                     0,
-                    ui::Hint::Warning("Apple: Incorrect verification code.".into()),
+                    ui::Hint::Warning("Ответ Apple: неверный код проверки.".into()),
                 );
             }
             Some(ui::CodeAnswer::More) => {
                 let ways = [
-                    "Text +1 (•••) •••-••42".to_string(),
-                    "Call +1 (•••) •••-••42".to_string(),
-                    "Send it to your Apple devices".to_string(),
-                    "Send the same again".to_string(),
-                    "Cancel the sign-in".to_string(),
+                    "Отправить SMS на +1 (•••) •••-••42".to_string(),
+                    "Позвонить на +1 (•••) •••-••42".to_string(),
+                    "Отправить на устройства Apple".to_string(),
+                    "Отправить ещё раз".to_string(),
+                    "Отменить вход".to_string(),
                 ];
-                match ui::choose("how should Apple send the code?", &ways) {
+                match ui::choose("как Apple отправит код?", &ways) {
                     Some(4) => {
-                        ui::failure("Sign-in cancelled.", "");
+                        ui::failure("Вход отменён.", "");
                         return false;
                     }
                     Some(i) => {
                         hints = vec![ui::Hint::Plain(match i {
-                            0 => "texted to +1 (•••) •••-••42".into(),
-                            1 => "Apple is calling +1 (•••) •••-••42".into(),
-                            _ => "sent to your Apple devices".into(),
+                            0 => "отправлено по SMS на +1 (•••) •••-••42".into(),
+                            1 => "Apple звонит на +1 (•••) •••-••42".into(),
+                            _ => "отправлено на ваши устройства Apple".into(),
                         })];
-                        ui::status("asking Apple for a new code");
+                        ui::status("запрос нового кода у Apple");
                         wait(900);
                     }
                     None => {}
                 }
             }
             Some(ui::CodeAnswer::Cancel) => {
-                ui::failure("Sign-in cancelled.", "");
+                ui::failure("Вход отменён.", "");
                 return false;
             }
-            None => match ui::ask("Code: ") {
+            None => match ui::ask("Код: ") {
                 Some(code) if code == "123456" => break,
                 Some(_) => {}
                 None => {
-                    ui::failure("Sign-in cancelled.", "");
+                    ui::failure("Вход отменён.", "");
                     return false;
                 }
             },
         }
-        ui::status("checking the code with Apple");
+        ui::status("проверка кода в Apple");
         wait(800);
     }
-    ui::status("checking the code with Apple");
+    ui::status("проверка кода в Apple");
     wait(900);
     true
 }
 
-/// Steps 5 to 7, signed by team `id`.
 fn sign_and_install(id: &str, kind: team::Kind, first: bool) -> bool {
-    ui::step(5, "Signing SideInstaller for this iPhone");
-    ui::status("downloading SideInstaller");
+    ui::step(5, "Подпись SideInstaller для этого iPhone");
+    ui::status("загрузка SideInstaller");
     let total: u64 = 24 * 1_048_576 + 400_000;
     for i in 0..=60u64 {
-        ui::progress("downloaded", total * i / 60, total);
+        ui::progress("загружено", total * i / 60, total);
         wait(45);
     }
     ui::progress_end();
-    ui::ok("downloaded SideInstaller (24.4 MB)");
-    ui::status("signing; this takes a while here");
+    ui::ok("SideInstaller загружен (24,4 МБ)");
+    ui::status("подписание (это может занять некоторое время)");
     wait(4200);
     ui::ok(&format!(
-        "signed SideInstaller as com.frizzlem.sideinstaller.{id}"
+        "SideInstaller подписан, идентификатор: com.frizzlem.sideinstaller.{id}"
     ));
-    ui::done("SideInstaller 1.7.0 signed");
+    ui::done("SideInstaller 1.7.0 подписан");
 
-    ui::step(6, "Installing it");
+    if !vpn_handoff(
+        "Подготовьтесь снова подключиться к iPhone",
+        &[
+            "Отключите обычный VPN, если он включён.",
+            "Снова включите LocalDevVPN.",
+        ],
+        "Продолжить установку",
+    ) {
+        ui::failure("Остановлено до установки SideInstaller.", "");
+        return false;
+    }
+
+    ui::step(6, "Установка SideInstaller");
     let total: u64 = 51 * 1_048_576;
-    ui::status("uploading 412 files (51.0 MB)");
+    ui::status("передача 412 файлов (51,0 МБ)");
     for i in 0..=80u64 {
-        ui::progress("uploaded", total * i / 80, total);
+        ui::progress("передано", total * i / 80, total);
         wait(50);
     }
     ui::progress_end();
-    ui::status("checking every file arrived whole");
+    ui::status("проверка целостности файлов");
     wait(700);
-    ui::status("installing");
+    ui::status("установка");
     for percent in (0..=100).step_by(4) {
-        ui::percent("installed", percent);
+        ui::percent("установлено", percent);
         wait(70);
     }
     ui::progress_end();
     ui::ok(&format!(
-        "SideInstaller installed (com.frizzlem.sideinstaller.{id})"
+        "SideInstaller установлен (com.frizzlem.sideinstaller.{id})"
     ));
-    ui::done("installed · 51.0 MB, 412 files");
+    ui::done("установлено · 51,0 МБ, 412 файлов");
 
-    ui::step(7, "Handing SideInstaller the pairing");
-    ui::activity("writing the pairing file into it");
+    ui::step(7, "Передача сопряжения в SideInstaller");
+    ui::activity("запись файла сопряжения");
     wait(900);
-    ui::done("SideInstaller has the pairing");
+    ui::done("SideInstaller получил файл сопряжения");
 
-    ui::link("Open SideInstaller", "sideinstaller://");
+    ui::link("Открыть SideInstaller", "sideinstaller://");
     ui::finish(
-        "SideInstaller is installed",
+        "SideInstaller установлен",
         &[
-            "Open it from your Home Screen. The first time, iOS asks you to trust your Apple \
-             Account: Settings › General › VPN & Device Management.",
+            "Откройте приложение с главного экрана. При первом запуске подтвердите доверие к учётной записи Apple: Настройки › Основные › VPN и управление устройством.",
             team::lasts(kind, first),
         ],
     );
     true
 }
 
-/// Step 2 as Minis 1.16 does it: siboot pairs this iPhone with itself.
-fn pair_here() -> bool {
-    ui::ok("Open Minis can pair this iPhone");
-    ui::status("start pairing when you're ready");
-    if !ui::get_ready(
-        "Pair this iPhone with siboot",
+fn vpn_handoff(title: &str, steps: &[&str], button: &str) -> bool {
+    ui::get_ready_and_confirm(
+        title,
+        steps,
         &[
-            "Open Settings › Privacy & Security › Developer Mode, and scroll to the bottom.",
-            "Tap Pair with siboot. It can take a few seconds to show.",
-            "Enter your iPhone passcode, then the 6-digit code siboot shows. It comes as a \
-             notification too.",
-            "Come back to Minis once Settings says it's paired.",
+            "Плеер с тишиной не даёт iOS приостановить Minis в Настройках. Не закрывайте его.",
+            "Вернитесь в Minis, закройте окно плеера, если оно перекрывает экран, и подтвердите продолжение.",
+            "LocalDevVPN нужен только для подключения к iPhone. siboot не может переключать или определять VPN.",
         ],
-        &["When you start, a player opens over Minis. It plays silence, which keeps Minis \
-           running while you're in Settings: leave it open. siboot closes it once you're back."],
-        "Start pairing",
+        button,
+    )
+}
+
+fn pair_here() -> bool {
+    ui::ok("Open Minis может выполнить сопряжение с iPhone");
+    ui::status("начните сопряжение, когда будете готовы");
+    if !ui::get_ready(
+        "Сопряжение iPhone с siboot",
+        &[
+            "Откройте Настройки › Конфиденциальность и безопасность › Режим разработчика и прокрутите вниз.",
+            "Нажмите Pair with siboot. Пункт может появиться через несколько секунд.",
+            "Введите код-пароль iPhone, затем шестизначный код siboot из уведомления.",
+            "Когда Настройки сообщат о сопряжении, вернитесь в Minis.",
+        ],
+        &["После начала поверх Minis откроется плеер с тишиной. Он не даст iOS приостановить Minis в Настройках — не закрывайте его. siboot остановит плеер после возвращения."],
+        "Начать сопряжение",
     ) {
-        ui::failure("Stopped before pairing.", "");
+        ui::failure("Остановлено до начала сопряжения.", "");
         return false;
     }
-    ui::ok("Pair with siboot is up in Settings");
-    ui::status("waiting for Pair with siboot in Settings (up to 10 minutes)");
+    ui::ok("Pair with siboot отображается в Настройках");
+    ui::status("ожидание Pair with siboot в Настройках (до 10 минут)");
     wait(2500);
-    ui::status("Settings connected: waiting for it to ask for a code");
+    ui::status("Настройки подключились: ожидание запроса кода");
     wait(600);
-    ui::status("waiting for the code to be typed into Settings");
-    ui::show_code("975088", "Type it into Settings. It came as a notification too.");
+    ui::status("ожидание ввода кода в Настройках");
+    ui::show_code(
+        "975088",
+        "Введите код в Настройках. Он также отправлен в уведомлении.",
+    );
     wait(5000);
     ui::code_gone();
-    ui::status("paired: go back to Minis to carry on");
+    ui::status("сопряжение выполнено: вернитесь в Minis, чтобы продолжить");
     wait(1500);
-    ui::ok("paired with Frizzle's iPhone (iPhone18,1)");
-    ui::activity("checking the new pairing with this iPhone");
+    ui::ok("сопряжение с iPhone Frizzle выполнено (iPhone18,1)");
+    ui::activity("проверка нового сопряжения на iPhone");
     wait(700);
-    ui::ok("this iPhone accepts the new pairing");
-    ui::done("paired here in Minis");
+    ui::ok("iPhone принимает новое сопряжение");
+    ui::done("сопряжение выполнено в Minis");
     true
 }
 
-/// Step 2 with siboot-pair offering its file from rootshell.
 fn take_from_rootshell() -> bool {
-    ui::ok("rootshell is offering its file");
+    ui::ok("rootshell предлагает файл сопряжения");
     let mut tries = 3;
     loop {
         let Some(code) = ui::ask_code(
-            "rootshell is offering its file",
-            "Code",
-            "type the transfer code it shows",
-            "Transfer code shown in rootshell: ",
+            "rootshell предлагает файл сопряжения",
+            "Код",
+            "введите показанный код передачи",
+            "Код передачи из rootshell: ",
         ) else {
-            ui::failure("Stopped at the transfer code.", "");
+            ui::failure("Остановлено на запросе кода передачи.", "");
             return false;
         };
-        ui::activity("sending the code to rootshell");
+        ui::activity("отправка кода в rootshell");
         wait(400);
         if code == "481516" {
             break;
         }
         tries -= 1;
         if tries == 0 {
-            ui::failure("The transfer code didn't match. Run siboot again and type the code rootshell shows.", "");
+            ui::failure("Код передачи не совпал. Запустите siboot снова и введите код, показанный rootshell.", "");
             return false;
         }
         ui::warn(&format!(
-            "That isn't the code rootshell shows ({tries} more {}).",
-            if tries == 1 { "try" } else { "tries" }
+            "Это не код из rootshell (осталось попыток: {tries}).",
         ));
     }
-    ui::ok("took the pairing file from rootshell (1184 bytes)");
-    ui::activity("checking it with this iPhone");
+    ui::ok("файл сопряжения получен из rootshell (1184 байт)");
+    ui::activity("проверка файла на iPhone");
     wait(700);
-    ui::done("taken from rootshell");
+    ui::done("получено из rootshell");
     true
 }
