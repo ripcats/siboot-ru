@@ -2,7 +2,7 @@
 set -eu
 
 BASE="${SIBOOT_BASE:-https://raw.githubusercontent.com/ripcats/siboot-ru/main/minis}"
-SHA256="cf6b604137f654113522f6f254ac69f060498ef83fd5e7243372406743231b46"
+SHA256="b09d2514003f61b518626af51e5efaeee471defc1a453b4a33984260bf120f82"
 SIZE=12143448
 
 DIR="$HOME/.siboot/bin"
